@@ -1,0 +1,11 @@
+numpy
+pandas
+omegaconf
+pytorch_lightning
+scikit_learn
+sentencepiece
+transformers
+datasets
+wandb
+kaggle
+rich
