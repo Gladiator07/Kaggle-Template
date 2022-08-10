@@ -11,6 +11,10 @@ ENVIRON=$1
 DOWNLOAD_DATA=$2
 PROJECT=""
 
+source .env
+export KAGGLE_USERNAME=$KAGGLE_USERNAME
+export KAGGLE_KEY=$KAGGLE_KEY
+
 pip install --upgrade -r requirements.txt
 
 cd ~/.
