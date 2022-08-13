@@ -27,9 +27,9 @@ cfg.trainer = dict(
 )
 
 # tracking
-# override version number from cmd for every new experiment for this config
-cfg.version = 1
-cfg.experiment_name = f"{cfg.version}_{cfg.name}"
+# override version number from cmd for every new run for this config
+cfg.version = 0
+cfg.experiment_name = f"{cfg.name}_v{cfg.version}"
 # override from cmd for short overview of the experiment
 cfg.notes = "baseline experiment"
 
