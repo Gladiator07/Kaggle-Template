@@ -30,8 +30,7 @@ def determine_env_and_set_root_paths(cfg: mlc.ConfigDict) -> mlc.ConfigDict:
         cfg.artifacts_dir = Path("/home/artifacts")
 
     else:
-        # raise NotImplementedError("Current Environment is not recognized")
-        cfg.environ = "local"
+        raise NotImplementedError("Current Environment is not recognized")
     return cfg
 
 
@@ -39,6 +38,9 @@ def determine_env_and_set_root_paths(cfg: mlc.ConfigDict) -> mlc.ConfigDict:
 cfg = mlc.ConfigDict()
 cfg.project = PROJECT
 cfg = determine_env_and_set_root_paths(cfg)
+
+# misc config
+cfg.filter_warnings = True
 
 # add default config specific to project here
 # ...
