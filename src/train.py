@@ -9,12 +9,10 @@ config_flags.DEFINE_config_file(
     default=None,
     help_string="Training Configuration from `configs` directory",
 )
-flags.DEFINE_boolean(
+flags.DEFINE_bool(
     "debug", default=False, help="debug pipeline with logging and tracking disabled"
 )
-flags.DEFINE_boolean(
-    "wandb_enabled", default=True, help="enable Weights & Biases logging"
-)
+flags.DEFINE_bool("wandb_enabled", default=True, help="enable Weights & Biases logging")
 
 FLAGS = flags.FLAGS
 
