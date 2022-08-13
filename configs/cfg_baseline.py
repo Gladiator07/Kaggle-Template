@@ -3,6 +3,7 @@ from default_config import get_default_config
 
 cfg = get_default_config()
 cfg.name = os.path.basename(__file__).split(".")[0]
+cfg.seed = 7
 
 # data
 cfg.datamodule = dict()
