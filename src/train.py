@@ -12,6 +12,7 @@ config_flags.DEFINE_config_file(
 flags.DEFINE_boolean(
     "debug", default=False, help="debug pipeline with logging and tracking disabled"
 )
+flags.DEFINE_bool("wandb_enabled", default=True, help="enable Weights & Biases logging")
 
 FLAGS = flags.FLAGS
 
