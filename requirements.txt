@@ -9,3 +9,5 @@ datasets
 wandb
 kaggle
 rich
+absl-py
+ml_collections
