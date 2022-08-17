@@ -25,6 +25,7 @@ TODO:
 [x] Add clip_grad_norm to training loop
 [ ] Add Weights & Biases logging (handle with care in distributed settings
 [x] Add saving and loading of model checkpoint (handle with care in distributed settings)
+[ ] Check optimization stuff (total training steps, accumulation , lr scheduler)
 [ ] Add a predict method which can perform prediction from loading a model state. Example: `trainer.predict(test_dataset, **kwargs)`
 [ ] Write a predict function with a support to easily add TTA if required
 [ ] Add option to choose between print to console or log to a file
@@ -71,12 +72,12 @@ class TrainerArguments:
     log_mode: Optional[bool] = "print"  # log
     save_best_checkpoint: Optional[bool] = True
     save_last_checkpoint: Optional[bool] = True
-    metric_for_best_model: Optional[str] = "accuracy"
     save_weights_only: Optional[bool] = True
+    metric_for_best_model: Optional[str] = "accuracy"
 
 
 """
-A boiler plate Trainer class which can be used with minimal to no customization for most of the problems
+A boiler plate Trainer class which can be used with minimal to no code changes for most of the problems
 For now no plan to make it fully generalizable, just copy paste this file and modify according to the project/competition if required
 """
 
@@ -85,8 +86,8 @@ class Trainer:
     def __init__(
         self,
         model: torch.nn.Module,
-        optimizer: torch.optim,  # passing from outside for now to have the flexibility to modify param groups
-        args: TrainerArguments,
+        optimizer: torch.optim = None,  # passing from outside for now to have the flexibility to modify param groups
+        args: TrainerArguments = None,
         train_dataset: Optional[Dataset] = None,
         val_dataset: Optional[Dataset] = None,
         train_sampler: Optional[Sampler] = None,
@@ -156,48 +157,14 @@ class Trainer:
                 drop_last=self.args.val_drop_last,
             )
 
-        # math around schedulers
-        self.num_update_steps_per_epoch = math.ceil(
-            len(self.train_dataloader) / self.args.gradient_accumulation_steps
-        )
-        # total training/optimization steps
-        self.num_train_steps = (
-            self.args.num_train_epochs * self.num_update_steps_per_epoch
-        )
-
-        # total warmup steps
-        if isinstance(self.args.num_warmup_steps, float):
-            self.args.num_warmup_steps = math.ceil(
-                self.args.num_warmup_steps * self.num_train_steps
-            )
-        # define linear/cosine scheduler
-        if self.args.scheduler_type == "cosine":
-            self.lr_scheduler = get_cosine_schedule_with_warmup(
-                self.optimizer,
-                num_warmup_steps=self.args.num_warmup_steps,
-                num_training_steps=self.num_train_steps,
-            )
-
-        elif self.args.scheduler_type == "linear":
-            self.lr_scheduler = get_linear_schedule_with_warmup(
-                self.optimizer,
-                num_warmup_steps=self.args.num_warmup_steps,
-                num_training_steps=self.num_train_steps,
-            )
-
         # prepare for distributed training aka put everything in 🤗 Accelerate 🚀
         (
             self.model,
             self.optimizer,
             self.train_dataloader,
             self.val_dataloader,
-            self.lr_scheduler,
         ) = self.accelerator.prepare(
-            self.model,
-            self.optimizer,
-            self.train_dataloader,
-            self.val_dataloader,
-            self.lr_scheduler,
+            self.model, self.optimizer, self.train_dataloader, self.val_dataloader
         )
 
         # re-calculate total training steps and epoch as the size of the training dataloader may have changed.
@@ -211,10 +178,19 @@ class Trainer:
             self.num_train_steps / self.num_update_steps_per_epoch
         )
 
+        if isinstance(self.args.num_warmup_steps, float):
+            self.args.num_warmup_steps = math.ceil(
+                self.args.num_warmup_steps * self.num_train_steps
+            )
+
         self.total_batch_size = (
             self.args.per_device_train_batch_size
             * self.accelerator.num_processes
             * self.args.gradient_accumulation_steps
+        )
+        # set learning rate scheduler
+        self.lr_scheduler = self._set_scheduler(
+            self.args.num_warmup_steps, self.num_train_steps
         )
 
     def _init_accelerator(self, *args, **kwargs):
@@ -226,6 +202,30 @@ class Trainer:
             else "no",
             gradient_accumulation_steps=self.args.gradient_accumulation_steps,
         )
+
+    def _set_scheduler(self, num_warmup_steps, num_train_steps):
+        """
+        Call after `accelerator.prepare`
+        """
+        # define linear/cosine scheduler
+        if self.args.scheduler_type == "cosine":
+            lr_scheduler = get_cosine_schedule_with_warmup(
+                self.optimizer,
+                num_warmup_steps=num_warmup_steps
+                * self.args.gradient_accumulation_steps,
+                num_training_steps=num_train_steps
+                * self.args.gradient_accumulation_steps,
+            )
+
+        elif self.args.scheduler_type == "linear":
+            lr_scheduler = get_linear_schedule_with_warmup(
+                self.optimizer,
+                num_warmup_steps=num_warmup_steps
+                * self.args.gradient_accumulation_steps,
+                num_training_steps=num_train_steps
+                * self.args.gradient_accumulation_steps,
+            )
+        return lr_scheduler
 
     def _init_global_progress_bar(self):
         self.global_prog_bar = tqdm(
@@ -247,15 +247,15 @@ class Trainer:
             with self.accelerator.accumulate(self.model):
                 logits, loss = self.model(**batch)
                 total_loss += loss.detach().float()
-            self.accelerator.backward(loss)
-            clip_grad_norm_(self.model.parameters(), self.args.max_grad_norm)
-            self.optimizer.step()
-            self.lr_scheduler.step()
-            self.optimizer.zero_grad()
+                self.accelerator.backward(loss)
+                clip_grad_norm_(self.model.parameters(), self.args.max_grad_norm)
+                self.optimizer.step()
+                self.lr_scheduler.step()
+                self.optimizer.zero_grad()
 
-            if self.accelerator.sync_gradients:
-                self.global_prog_bar.set_postfix(loss=loss.item())
-                self.global_prog_bar.update(1)
+                if self.accelerator.sync_gradients:
+                    self.global_prog_bar.set_postfix(loss=loss.item())
+                    self.global_prog_bar.update(1)
 
         # can also calculate metrics here for training epoch via `compute_metrics` Callable function
         # ...
@@ -339,23 +339,27 @@ class Trainer:
             self._log_epoch_summary()
 
             # save best epoch model
-            if (
-                self._current_val_metrics[self.args.metric_for_best_model]
-                > best_val_metric
-            ):
-                best_val_metric = self._current_val_metrics[
-                    self.args.metric_for_best_model
-                ]
-                self.save_model(
-                    path=os.path.join(self.args.output_dir, "best_model.pth"),
-                    weights_only=self.args.save_weights_only,
-                )
+            if self.args.save_best_checkpoint:
+                if (
+                    self._current_val_metrics[self.args.metric_for_best_model]
+                    > best_val_metric
+                ):
+                    best_val_metric = self._current_val_metrics[
+                        self.args.metric_for_best_model
+                    ]
+                    self.save_model(
+                        path=os.path.join(self.args.output_dir, "best_model.pth"),
+                        weights_only=self.args.save_weights_only,
+                    )
+
+        self.global_prog_bar.close()
 
         # save last model
-        self.save_model(
-            path=os.path.join(self.args.output_dir, "last_model.pth"),
-            weights_only=self.args.save_weights_only,
-        )
+        if self.args.save_last_checkpoint:
+            self.save_model(
+                path=os.path.join(self.args.output_dir, "last_model.pth"),
+                weights_only=self.args.save_weights_only,
+            )
 
     def _train_startup_log_msg(self):
         self.accelerator.print("***** Running training *****")
@@ -370,6 +374,7 @@ class Trainer:
         self.accelerator.print(
             f"  Gradient Accumulation steps = {self.args.gradient_accumulation_steps}"
         )
+        self.accelerator.print(f"  Num warmup steps = {self.args.num_warmup_steps}")
         self.accelerator.print(f"  Total optimization steps = {self.num_train_steps}")
 
     def _log_epoch_summary(self):
