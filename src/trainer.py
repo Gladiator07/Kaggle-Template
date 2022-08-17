@@ -31,6 +31,7 @@ TODO:
 [ ] Maybe wrap up the math around scheduler in a private method
 [ ] Write a predict function with a support to easily add TTA if required
 [ ] Add log_every_n_steps functionality (maybe to reduce bottlenecks while on TPUs)
+[ ] Add type hints
 [ ] Add docstrings 😛
 """
 
@@ -296,13 +297,6 @@ class Trainer:
                 self.valid_dataloader
             )
             self._log_epoch_summary()
-            summary_metrics = []
-            for m, v in eval_metrics.items():
-                tmp_str = f"valid_{m}: {v:.4f}"
-                summary_metrics.append(tmp_str)
-            eval_metrics = "  |  ".join(summary_metrics)
-            summary_str = f"  Epoch {self._current_epoch}  |  train_loss: {trn_epoch_loss:.4f}  |  valid_loss: {val_epoch_loss:.4f}  |  {eval_metrics}"
-            self.accelerator.print(summary_str)
             self._current_epoch += 1
 
     def _train_startup_log_msg(self):
@@ -321,4 +315,10 @@ class Trainer:
         self.accelerator.print(f"  Total optimization steps = {self.num_train_steps}")
 
     def _log_epoch_summary(self):
-        pass
+        summary_metrics = []
+        for m, v in eval_metrics.items():
+            tmp_str = f"valid_{m}: {v:.4f}"
+            summary_metrics.append(tmp_str)
+        eval_metrics = "  |  ".join(summary_metrics)
+        summary_str = f"  Epoch {self._current_epoch}  |  train_loss: {trn_epoch_loss:.4f}  |  valid_loss: {val_epoch_loss:.4f}  |  {eval_metrics}"
+        self.accelerator.print(summary_str)
