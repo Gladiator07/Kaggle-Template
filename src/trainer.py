@@ -1,7 +1,7 @@
 # Inspired from HuggingFace Trainer and Tez
 # https://huggingface.co/docs/transformers/main_classes/trainer
 # https://github.com/abhishekkrthakur/tez
-
+import os
 import math
 import multiprocessing
 from dataclasses import dataclass
@@ -21,16 +21,17 @@ from transformers import (
 """
 TODO:
 [x] Print valuation metrics nicely after each epoch
-[ ] Add clip_grad_norm to training loop
+[x] Add clip_grad_norm to training loop
 [ ] Add Weights & Biases logging (handle with care in distributed settings
-[ ] Add saving and loading of model checkpoint (handle with care in distributed settings)
+[x] Add saving and loading of model checkpoint (handle with care in distributed settings)
+[ ] Add a predict method which can perform prediction from loading a model state. Example: `trainer.predict(test_dataset, **kwargs)`
+[ ] Write a predict function with a support to easily add TTA if required
 [ ] Add option to choose between print to console or log to a file
 [ ] Add a `final_summary` method which will print the complete summary per epoch (losses and metrics) in a table form
+[ ] Add helpful print/log messages while training
 [ ] Test the code thoroughly with multi-GPU setup
 [ ] Test the code thoroughly with TPU setup 
-[ ] Add helpful print/log messages while training
 [ ] Maybe wrap up the math around scheduler in a private method
-[ ] Write a predict function with a support to easily add TTA if required
 [ ] Add log_every_n_steps functionality (maybe to reduce bottlenecks while on TPUs)
 [ ] Add type hints
 [ ] Add docstrings 😛
@@ -39,6 +40,7 @@ TODO:
 
 @dataclass
 class TrainerArguments:
+    output_dir: str
     per_device_train_batch_size: Optional[int] = 32
     per_device_val_batch_size: Optional[int] = 32
 
@@ -68,6 +70,8 @@ class TrainerArguments:
     log_mode: Optional[bool] = "print"  # log
     save_best_checkpoint: Optional[bool] = True
     save_last_checkpoint: Optional[bool] = True
+    metric_for_best_model: Optional[str] = "accuracy"
+    save_weights_only: Optional[bool] = True
 
 
 """
@@ -281,13 +285,35 @@ class Trainer:
         avg_loss = total_loss / len(dataloader)
         return all_logits, all_labels, val_metrics, avg_loss
 
-    def save_model(self, weights_only: Optional[bool] = False, **kwargs):
-        # make sure to handle distributed case here
-        pass
+    def save_model(self, path: str, weights_only: Optional[bool] = False, **kwargs):
+        self.accelerator.wait_for_everyone()
+        model_state_dict = self.accelerator.unwrap_model(self.model).state_dict()
+        if weights_only:
+            if self.accelerator.is_main_process:
+                self.accelerator.save(model_state_dict, path)
+            return
+        model_dict = {}
+        model_dict["state_dict"] = model_state_dict
+        model_dict["optimizer"] = self.optimizer.state_dict()
+        model_dict["scheduler"] = self.lr_scheduler.state_dict()
+        model_dict["args"] = self.args
 
-    def load_model(self, weights_only: Optional[bool] = False, **kwargs):
-        # make sure to handle distributed case here
-        pass
+        if self.accelerator.is_main_process:
+            self.accelerator.save(
+                model_dict,
+                path,
+            )
+
+    def load_model(self, path: str, weights_only: Optional[bool] = False, **kwargs):
+        self.accelerator.wait_for_everyone()
+        model_state_dict = torch.load(path, map_location="cpu")
+        if weights_only:
+            self.accelerator.unwrap_model(self.model).load_state_dict(model_state_dict)
+        else:
+            self.accelerator.unwrap_model(self.model).load_state_dict(
+                model_state_dict["state_dict"]
+            )
+            self.optimizer.load_state_dict(model_state_dict["optimizer"])
 
     def predict(self, **kwargs):
         # make sure to handle distributed case here
@@ -296,6 +322,8 @@ class Trainer:
     def fit(self):
         self._train_startup_log_msg()
         self._init_global_progress_bar()
+        best_loss = -np.inf
+        best_val_metric = 0
         for epoch in range(self.args.num_train_epochs):
             trn_epoch_loss = self.train_one_epoch(self.train_dataloader)
             logits, labels, val_metrics, val_epoch_loss = self.evaluate(
@@ -306,6 +334,25 @@ class Trainer:
             self._current_epoch_val_loss = val_epoch_loss
             self._current_val_metrics.update(val_metrics)
             self._log_epoch_summary()
+
+            # save best epoch model
+            if (
+                self._current_val_metrics[self.args.metric_for_best_model]
+                > best_val_metric
+            ):
+                best_val_metric = self._current_val_metrics[
+                    self.args.metric_for_best_model
+                ]
+                self.save_model(
+                    path=os.path.join(self.args.output_dir, "best_model.pth"),
+                    weights_only=self.args.save_weights_only,
+                )
+
+        # save last model
+        self.save_model(
+            path=os.path.join(self.args.output_dir, "last_model.pth"),
+            weights_only=self.args.save_weights_only,
+        )
 
     def _train_startup_log_msg(self):
         self.accelerator.print("***** Running training *****")
