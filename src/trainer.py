@@ -276,8 +276,8 @@ class Trainer:
         all_labels = np.concatenate(all_labels)
 
         eval_metrics = self.compute_metrics(all_logits, all_labels)
-
-        return all_logits, all_labels, eval_metrics, total_loss
+        avg_loss = total_loss / len(dataloader)
+        return all_logits, all_labels, eval_metrics, avg_loss
 
     def save_model(self, weights_only: Optional[bool] = False, **kwargs):
         # make sure to handle distributed case here
