@@ -17,6 +17,21 @@ from transformers import (
     get_linear_schedule_with_warmup,
 )
 
+"""
+TODO:
+[ ] Add clip_grad_norm to training loop
+[ ] Add Weights & Biases logging (handle with care in distributed settings
+[ ] Add saving and loading of model checkpoint (handle with care in distributed settings)
+[ ] Add option to choose between print to console or log to a file
+[ ] Test the code thoroughly with multi-GPU setup
+[ ] Test the code thoroughly with TPU setup 
+[ ] Add helpful print/log messages while training
+[ ] Print evaluation metrics nicely after each epoch
+[ ] Maybe wrap up the math around scheduler in a private method
+[ ] Write a predict function with a support to easily add TTA if required
+[ ] Add log_every_n_steps functionality (maybe to reduce bottlenecks while on TPUs)
+"""
+
 
 @dataclass
 class TrainerArguments:
@@ -212,7 +227,7 @@ class Trainer:
         self.model.train()
         total_loss = 0
 
-        for step, batch in enumerate(self.train_dataloader):
+        for step, batch in enumerate(dataloader):
             with self.accelerator.accumulate(self.model):
                 logits, loss = self.model(**batch)
                 total_loss += loss.detach().float()
@@ -224,11 +239,35 @@ class Trainer:
         if self.accelerator.sync_gradients:
             self.global_prog_bar.update(1)
 
-        return total_loss.item() / len(self.train_dataloader)
+        # can also calculate metrics here for training epoch via `compute_metrics` Calllable function
+        # ...
+        return total_loss.item() / len(dataloader)
 
     @torch.no_grad()
     def evaluate(self, dataloader):
-        pass
+        all_logits = []
+        all_labels = []
+        total_loss = 0
+        eval_pbar = tqdm(
+            range(len(dataloader)),
+            disable=not self.accelerator.is_main_process,
+            leave=False,
+        )
+        self.model.eval()
+        for step, batch in enumerate(dataloader):
+            logits, loss = self.model(**batch)
+            total_loss += loss.item()
+            all_logits.append(self.accelerator.gather_for_metrics(logits).cpu().numpy())
+            all_labels.append(self.accelerator.gather_for_metrics(batch["labels"]))
+            eval_pbar.update(1)
+
+        all_logits = np.concatenate(all_logits)
+        all_labels = np.concatenate(all_labels)
+
+        eval_metrics = self.compute_metrics(all_logits, all_labels)
+
+        self.accelerator.print(eval_metrics)
+        return all_logits, all_labels, eval_metrics
 
     def save_model(self, weights_only: Optional[bool] = False, **kwargs):
         # make sure to handle distributed case here
@@ -244,3 +283,18 @@ class Trainer:
 
     def fit(self):
         pass
+
+    def _startup_log_msg(self):
+        self.accelerator.print("***** Running training *****")
+        self.accelerator.print(f"  Num examples = {len(self.train_dataset)}")
+        self.accelerator.print(f"  Num Epochs = {self.args.num_train_epochs}")
+        self.accelerator.print(
+            f"  Instantaneous batch size per device = {self.args.per_device_train_batch_size}"
+        )
+        self.accelerator.print(
+            f"  Total train batch size (w. parallel, distributed & accumulation) = {self.total_batch_size}"
+        )
+        self.accelerator.print(
+            f"  Gradient Accumulation steps = {self.args.gradient_accumulation_steps}"
+        )
+        self.accelerator.print(f"  Total optimization steps = {self.num_train_steps}")
