@@ -4,9 +4,10 @@ import multiprocessing
 from dataclasses import dataclass
 from typing import Callable, Optional, Union
 
+import numpy as np
 import torch
 from accelerate import Accelerator
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, Sampler
 from tqdm.auto import tqdm
 from transformers import (
     get_cosine_schedule_with_warmup,
@@ -80,53 +81,55 @@ GOTCHAS
 class Trainer:
     def __init__(
         self,
-        args: Optional[TrainerArguments],
         model: torch.nn.Module,
         optimizer: torch.optim,  # passing from outside for now to have the flexibility to modify param groups
+        args: TrainerArguments,
+        train_dataset: Optional[Dataset] = None,
+        valid_dataset: Optional[Dataset] = None,
+        train_sampler: Optional[Sampler] = None,
+        valid_sampler: Optional[Sampler] = None,
+        train_collate_fn: Optional[Callable] = None,
+        valid_collate_fn: Optional[Callable] = None,
+        train_dataloader: Optional[DataLoader] = None,
+        valid_dataloader: Optional[DataLoader] = None,
+        compute_metrics: Optional[Callable] = None,
     ):
+        """
+        - Either pass train_dataset, valid_dataset and trainer will create dataloader on its own.
+        - If you want special samplers and collate functions then you can pass them too and they will be assigned to dataloader.
+        - Or you can simply pass the dataloaders and this trainer will use those without constructing on its own.
+        """
 
+        # model should be instantiated before accelerator init
+        # as on TPU it may load this model on all processes
+        # and RAM may explode!
         self.model = model
         self.optimizer = optimizer
         self.args = args
 
-    def _init_accelerator(self, *args, **kwargs):
-        self.accelerator = Accelerator(
-            device_placement=True,
-            step_scheduler_with_optimizer=False,
-            mixed_precision=self.args.mixed_precision
-            if self.args.mixed_precision is not None
-            else "no",
-            gradient_accumulation_steps=self.args.gradient_accumulation_steps,
-        )
-
-    def _init_trainer(
-        self,
-        train_dataset: Optional[Dataset],
-        valid_dataset: Optional[Dataset],
-        compute_metrics: Optional[Callable] = None,
-        **kwargs,
-    ):
         self._init_accelerator()
+
         # dataset
         self.train_dataset = train_dataset
         self.valid_dataset = valid_dataset
-        # dataloader
-        self.train_dataloader = kwargs.get("train_dataloader", None)
-        self.valid_dataloader = kwargs.get("valid_dataloader", None)
+
         # sampler
-        self.train_sampler = kwargs.get("train_sampler", None)
-        self.valid_sampler = kwargs.get("valid_sampler", None)
+        self.train_sampler = train_sampler
+        self.valid_sampler = valid_sampler
         # collate fns
-        self.train_collate_fn = kwargs.get("train_collate_fn", None)
-        self.valid_collate_fn = kwargs.get("valid_collate_fn", None)
+        self.train_collate_fn = train_collate_fn
+        self.valid_collate_fn = valid_collate_fn
         self.compute_metrics = compute_metrics
+        # dataloader
+        self.train_dataloader = train_dataloader
+        self.valid_dataloader = valid_dataloader
 
         if self.args.num_workers == -1:
             self.args.num_workers = multiprocessing.cpu_count()
             if self.args.num_workers > 4:
                 self.args.num_workers -= 2
 
-        # if not provided in the fit/validate function, then create dataloaders
+        # if not provided then create dataloaders from datasets/samplers/collate_fns
         if self.train_dataloader is None:
             self.train_dataloader = DataLoader(
                 train_dataset,
@@ -149,16 +152,7 @@ class Trainer:
                 drop_last=self.args.valid_drop_last,
             )
 
-        if self.valid_dataloader is None:
-            (
-                self.model,
-                self.optimizer,
-                self.train_dataloader,
-            ) = self.accelerator.prepare(
-                self.model, self.train_dataloader, self.optimizer
-            )
-
-        else:
+            # prepare for distributed training aka put everything in HF Accelerate
             (
                 self.model,
                 self.optimizer,
@@ -168,7 +162,7 @@ class Trainer:
                 self.model, self.optimizer, self.train_dataloader, self.valid_dataloader
             )
 
-        # now calculate total training steps as prepare method may change its length
+        # calculate total training steps as prepare method may change dataloaders length
         if isinstance(self.args.num_warmup_steps, float):
             num_warmup_steps = self.args.num_warmup_steps * len(self.train_dataloader)
         elif isinstance(self.args.num_warmup_steps, int):
@@ -195,14 +189,29 @@ class Trainer:
             disable=not self.accelerator.is_main_process,
         )
 
+    def _init_accelerator(self, *args, **kwargs):
+        self.accelerator = Accelerator(
+            device_placement=True,
+            step_scheduler_with_optimizer=False,
+            mixed_precision=self.args.mixed_precision
+            if self.args.mixed_precision is not None
+            else "no",
+            gradient_accumulation_steps=self.args.gradient_accumulation_steps,
+        )
+
     def train_one_step(self, batch):
         with self.accelerator.accumulate(self.model):
+
             _, loss = self.model(**batch)
             self.accelerator.backward(loss)
+
             self.optimizer.step()
             self.lr_scheduler.step()
             self.optimizer.zero_grad()
+
             self.global_prog_bar.update(1)
+            self.global_prog_bar.set_postfix(loss=loss)
+
         return loss
 
     def train_one_epoch(self, dataloader):
@@ -217,16 +226,22 @@ class Trainer:
 
     @torch.no_grad()
     def evaluate_one_step(self, batch):
-        logits, _ = self.model(**batch)
+        model_out, loss = self.model(**batch)
         labels = batch["label"]
-        return logits, labels
+        return model_out, loss, labels
 
     @torch.no_grad()
     def evaluate(self, dataloader):
-        # TODO: add support for doing only evaluation
-        # by just loading the model state
-        all_logits = []
+        """
+        Model forward method (from the model class) can return anything you want in the dictionary format or just a single output vector
+        The reason for supporting the dictionary format is if any advance processing of the multiple outputs is required by
+        the `compute_metrics` for calculation of metrics.
+        """
+        # TODO: add support for doing only evaluation by just loading the model state
+        all_model_outs = []
         all_labels = []
+
+        total_loss = 0.0
         eval_pbar = tqdm(
             range(len(dataloader)),
             disable=self.accelerator.is_main_process,
@@ -234,15 +249,26 @@ class Trainer:
         )
         self.model.eval()
         for batch_idx, batch in enumerate(dataloader):
-            logits, labels = self.evaluate_one_step(batch)
-            logits, labels = self.accelerator.gather_for_metrics((logits, labels))
-            all_logits.append(logits.cpu().numpy())
+            model_out, loss, labels = self.evaluate_one_step(batch)
+
+            if isinstance(model_out, dict):
+                for k in model_out.keys():
+                    model_out[k] = self.accelerator.gather_for_metrics(model_out[k])
+                    all_model_outs.append(model_out[k].cpu().numpy())
+            else:
+                model_out = self.accelerator.gather_for_metrics(model_out)
+                all_model_outs.append(model_out.cpu().numpy())
+
+            loss, labels = self.accelerator.gather_for_metrics((model_out, labels))
+            total_loss += loss
+
             all_labels.append(labels.cpu().numpy())
             eval_pbar.update(1)
         eval_pbar.close()
-        metrics = self.compute_metrics(all_logits, all_labels)
+        avg_loss = total_loss / len(dataloader)
+        metrics = self.compute_metrics(all_model_outs, all_labels)
 
-        return all_logits, all_labels, metrics
+        return all_model_outs, all_labels, metrics
 
     def save_model(self, weights_only: Optional[bool] = False, **kwargs):
         # make sure to handle distributed case here
