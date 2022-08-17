@@ -102,7 +102,10 @@ class Trainer:
         self.args = args
 
         # internals
-        self._current_epoch = 1
+        self._current_epoch = 0
+        self._current_epoch_train_loss = 0.0
+        self._current_epoch_valid_loss = 0.0
+        self._current_valid_metrics = {}
         self._init_accelerator()
 
         # dataset
@@ -245,7 +248,7 @@ class Trainer:
                 self.global_prog_bar.set_postfix(loss=loss.item())
                 self.global_prog_bar.update(1)
 
-        # can also calculate metrics here for training epoch via `compute_metrics` Calllable function
+        # can also calculate metrics here for training epoch via `compute_metrics` Callable function
         # ...
         return total_loss.item() / len(dataloader)
 
@@ -293,11 +296,14 @@ class Trainer:
         self._init_global_progress_bar()
         for epoch in range(self.args.num_train_epochs):
             trn_epoch_loss = self.train_one_epoch(self.train_dataloader)
-            logits, labels, eval_metrics, val_epoch_loss = self.evaluate(
+            logits, labels, valid_metrics, val_epoch_loss = self.evaluate(
                 self.valid_dataloader
             )
-            self._log_epoch_summary()
             self._current_epoch += 1
+            self._current_epoch_train_loss = trn_epoch_loss
+            self._current_epoch_valid_loss = val_epoch_loss
+            self._current_valid_metrics.update(valid_metrics)
+            self._log_epoch_summary()
 
     def _train_startup_log_msg(self):
         self.accelerator.print("***** Running training *****")
@@ -320,5 +326,5 @@ class Trainer:
             tmp_str = f"valid_{m}: {v:.4f}"
             summary_metrics.append(tmp_str)
         eval_metrics = "  |  ".join(summary_metrics)
-        summary_str = f"  Epoch {self._current_epoch}  |  train_loss: {trn_epoch_loss:.4f}  |  valid_loss: {val_epoch_loss:.4f}  |  {eval_metrics}"
+        summary_str = f"  Epoch {self._current_epoch}  |  train_loss: {self._current_epoch_train_loss:.4f}  |  valid_loss: {self._current_epoch_valid_loss:.4f}  |  {self._current_valid_metrics}"
         self.accelerator.print(summary_str)
