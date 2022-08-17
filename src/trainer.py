@@ -255,7 +255,7 @@ class Trainer:
         return total_loss.item() / len(dataloader)
 
     @torch.no_grad()
-    def valuate(self, dataloader):
+    def evaluate(self, dataloader):
         all_logits = []
         all_labels = []
         total_loss = 0
@@ -264,7 +264,7 @@ class Trainer:
             disable=not self.accelerator.is_main_process,
             leave=False,
         )
-        self.model.val()
+        self.model.eval()
         for step, batch in enumerate(dataloader):
             logits, loss = self.model(**batch)
             total_loss += loss.item()
@@ -298,7 +298,7 @@ class Trainer:
         self._init_global_progress_bar()
         for epoch in range(self.args.num_train_epochs):
             trn_epoch_loss = self.train_one_epoch(self.train_dataloader)
-            logits, labels, val_metrics, val_epoch_loss = self.valuate(
+            logits, labels, val_metrics, val_epoch_loss = self.evaluate(
                 self.val_dataloader
             )
             self._current_epoch += 1
