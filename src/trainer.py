@@ -212,7 +212,7 @@ class Trainer:
 
         self.total_batch_size = (
             self.args.per_device_train_batch_size
-            * self.accelerator.is_main_process
+            * self.accelerator.num_processes
             * self.args.gradient_accumulation_steps
         )
 
@@ -274,7 +274,7 @@ class Trainer:
             total_loss += loss.item()
             all_logits.append(self.accelerator.gather_for_metrics(logits).cpu().numpy())
             all_labels.append(
-                self.accelerator.gather_for_metrics(batch["label"].cpu().numpy())
+                self.accelerator.gather_for_metrics(batch["label"]).cpu().numpy()
             )
             val_pbar.update(1)
         val_pbar.close()
