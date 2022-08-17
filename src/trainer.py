@@ -321,10 +321,10 @@ class Trainer:
         self.accelerator.print(f"  Total optimization steps = {self.num_train_steps}")
 
     def _log_epoch_summary(self):
-        summary_metrics = []
-        for m, v in eval_metrics.items():
+        metrics_summary = []
+        for m, v in self._current_valid_metrics.items():
             tmp_str = f"valid_{m}: {v:.4f}"
-            summary_metrics.append(tmp_str)
-        eval_metrics = "  |  ".join(summary_metrics)
-        summary_str = f"  Epoch {self._current_epoch}  |  train_loss: {self._current_epoch_train_loss:.4f}  |  valid_loss: {self._current_epoch_valid_loss:.4f}  |  {self._current_valid_metrics}"
+            metrics_summary.append(tmp_str)
+        metrics_summary = "  |  ".join(metrics_summary)
+        summary_str = f"  Epoch {self._current_epoch}  |  train_loss: {self._current_epoch_train_loss:.4f}  |  valid_loss: {self._current_epoch_valid_loss:.4f}  |  {metrics_summary}"
         self.accelerator.print(summary_str)
