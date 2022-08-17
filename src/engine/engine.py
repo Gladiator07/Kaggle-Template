@@ -19,17 +19,19 @@ from transformers import (
 
 """
 TODO:
+[ ] Print evaluation metrics nicely after each epoch
 [ ] Add clip_grad_norm to training loop
 [ ] Add Weights & Biases logging (handle with care in distributed settings
 [ ] Add saving and loading of model checkpoint (handle with care in distributed settings)
 [ ] Add option to choose between print to console or log to a file
+[ ] Add a `final_summary` method which will print the complete summary per epoch (losses and metrics) in a table form
 [ ] Test the code thoroughly with multi-GPU setup
 [ ] Test the code thoroughly with TPU setup 
 [ ] Add helpful print/log messages while training
-[ ] Print evaluation metrics nicely after each epoch
 [ ] Maybe wrap up the math around scheduler in a private method
 [ ] Write a predict function with a support to easily add TTA if required
 [ ] Add log_every_n_steps functionality (maybe to reduce bottlenecks while on TPUs)
+[ ] Add docstrings 😛
 """
 
 
@@ -98,6 +100,8 @@ class Trainer:
         self.optimizer = optimizer
         self.args = args
 
+        # internals
+        self._current_epoch = 1
         self._init_accelerator()
 
         # dataset
@@ -236,8 +240,9 @@ class Trainer:
             self.lr_scheduler.step()
             self.optimizer.zero_grad()
 
-        if self.accelerator.sync_gradients:
-            self.global_prog_bar.update(1)
+            if self.accelerator.sync_gradients:
+                self.global_prog_bar.set_postfix(loss=loss.item())
+                self.global_prog_bar.update(1)
 
         # can also calculate metrics here for training epoch via `compute_metrics` Calllable function
         # ...
@@ -258,16 +263,17 @@ class Trainer:
             logits, loss = self.model(**batch)
             total_loss += loss.item()
             all_logits.append(self.accelerator.gather_for_metrics(logits).cpu().numpy())
-            all_labels.append(self.accelerator.gather_for_metrics(batch["labels"]))
+            all_labels.append(
+                self.accelerator.gather_for_metrics(batch["label"].cpu().numpy())
+            )
             eval_pbar.update(1)
-
+        eval_pbar.close()
         all_logits = np.concatenate(all_logits)
         all_labels = np.concatenate(all_labels)
 
         eval_metrics = self.compute_metrics(all_logits, all_labels)
 
-        self.accelerator.print(eval_metrics)
-        return all_logits, all_labels, eval_metrics
+        return all_logits, all_labels, eval_metrics, total_loss
 
     def save_model(self, weights_only: Optional[bool] = False, **kwargs):
         # make sure to handle distributed case here
@@ -282,9 +288,24 @@ class Trainer:
         pass
 
     def fit(self):
-        pass
+        self._train_startup_log_msg()
+        self._init_global_progress_bar()
+        for epoch in range(self.args.num_train_epochs):
+            trn_epoch_loss = self.train_one_epoch(self.train_dataloader)
+            logits, labels, eval_metrics, val_epoch_loss = self.evaluate(
+                self.valid_dataloader
+            )
+            self._log_epoch_summary()
+            summary_metrics = []
+            for m, v in eval_metrics.items():
+                tmp_str = f"valid_{m}: {v:.4f}"
+                summary_metrics.append(tmp_str)
+            eval_metrics = "  |  ".join(summary_metrics)
+            summary_str = f"  Epoch {self._current_epoch}  |  train_loss: {trn_epoch_loss:.4f}  |  valid_loss: {val_epoch_loss:.4f}  |  {eval_metrics}"
+            self.accelerator.print(summary_str)
+            self._current_epoch += 1
 
-    def _startup_log_msg(self):
+    def _train_startup_log_msg(self):
         self.accelerator.print("***** Running training *****")
         self.accelerator.print(f"  Num examples = {len(self.train_dataset)}")
         self.accelerator.print(f"  Num Epochs = {self.args.num_train_epochs}")
@@ -298,3 +319,6 @@ class Trainer:
             f"  Gradient Accumulation steps = {self.args.gradient_accumulation_steps}"
         )
         self.accelerator.print(f"  Total optimization steps = {self.num_train_steps}")
+
+    def _log_epoch_summary(self):
+        pass
