@@ -39,7 +39,7 @@ TODO:
 @dataclass
 class TrainerArguments:
     per_device_train_batch_size: Optional[int] = 32
-    per_device_valid_batch_size: Optional[int] = 32
+    per_device_val_batch_size: Optional[int] = 32
 
     num_train_epochs: Optional[int] = 5
     gradient_accumulation_steps: Optional[int] = 1
@@ -49,9 +49,9 @@ class TrainerArguments:
 
     # dataloader args
     train_shuffle: Optional[bool] = True
-    valid_shuffle: Optional[bool] = False
+    val_shuffle: Optional[bool] = False
     train_drop_last: Optional[bool] = False
-    valid_drop_last: Optional[bool] = False
+    val_drop_last: Optional[bool] = False
     test_drop_last: Optional[bool] = False
     test_shuffle: Optional[bool] = False
     pin_memory: Optional[bool] = True
@@ -82,17 +82,17 @@ class Trainer:
         optimizer: torch.optim,  # passing from outside for now to have the flexibility to modify param groups
         args: TrainerArguments,
         train_dataset: Optional[Dataset] = None,
-        valid_dataset: Optional[Dataset] = None,
+        val_dataset: Optional[Dataset] = None,
         train_sampler: Optional[Sampler] = None,
-        valid_sampler: Optional[Sampler] = None,
+        val_sampler: Optional[Sampler] = None,
         train_collate_fn: Optional[Callable] = None,
-        valid_collate_fn: Optional[Callable] = None,
+        val_collate_fn: Optional[Callable] = None,
         train_dataloader: Optional[DataLoader] = None,
-        valid_dataloader: Optional[DataLoader] = None,
+        val_dataloader: Optional[DataLoader] = None,
         compute_metrics: Optional[Callable] = None,
     ):
         """
-        - Either pass train_dataset, valid_dataset and trainer will create dataloader on its own.
+        - Either pass train_dataset, val_dataset and trainer will create dataloader on its own.
         - If you want special samplers and collate functions then you can pass them too and they will be assigned to dataloader.
         - Or you can simply pass the dataloaders and this trainer will use those without constructing on its own.
         """
@@ -104,23 +104,23 @@ class Trainer:
         # internals
         self._current_epoch = 0
         self._current_epoch_train_loss = 0.0
-        self._current_epoch_valid_loss = 0.0
-        self._current_valid_metrics = {}
+        self._current_epoch_val_loss = 0.0
+        self._current_val_metrics = {}
         self._init_accelerator()
 
         # dataset
         self.train_dataset = train_dataset
-        self.valid_dataset = valid_dataset
+        self.val_dataset = val_dataset
         # sampler
         self.train_sampler = train_sampler
-        self.valid_sampler = valid_sampler
+        self.val_sampler = val_sampler
         # collate fns
         self.train_collate_fn = train_collate_fn
-        self.valid_collate_fn = valid_collate_fn
+        self.val_collate_fn = val_collate_fn
         self.compute_metrics = compute_metrics
         # dataloader
         self.train_dataloader = train_dataloader
-        self.valid_dataloader = valid_dataloader
+        self.val_dataloader = val_dataloader
 
         if self.args.num_workers == -1:
             self.args.num_workers = multiprocessing.cpu_count()
@@ -139,15 +139,15 @@ class Trainer:
                 drop_last=self.args.train_drop_last,
             )
 
-        if self.valid_dataloader is None:
-            self.valid_dataloader = DataLoader(
-                valid_dataset,
-                batch_size=self.args.per_device_valid_batch_size,
-                shuffle=self.args.valid_shuffle,
-                collate_fn=self.valid_collate_fn,
-                sampler=self.valid_sampler,
+        if self.val_dataloader is None:
+            self.val_dataloader = DataLoader(
+                val_dataset,
+                batch_size=self.args.per_device_val_batch_size,
+                shuffle=self.args.val_shuffle,
+                collate_fn=self.val_collate_fn,
+                sampler=self.val_sampler,
                 num_workers=self.args.num_workers,
-                drop_last=self.args.valid_drop_last,
+                drop_last=self.args.val_drop_last,
             )
 
         # math around schedulers
@@ -184,13 +184,13 @@ class Trainer:
             self.model,
             self.optimizer,
             self.train_dataloader,
-            self.valid_dataloader,
+            self.val_dataloader,
             self.lr_scheduler,
         ) = self.accelerator.prepare(
             self.model,
             self.optimizer,
             self.train_dataloader,
-            self.valid_dataloader,
+            self.val_dataloader,
             self.lr_scheduler,
         )
 
@@ -296,13 +296,13 @@ class Trainer:
         self._init_global_progress_bar()
         for epoch in range(self.args.num_train_epochs):
             trn_epoch_loss = self.train_one_epoch(self.train_dataloader)
-            logits, labels, valid_metrics, val_epoch_loss = self.evaluate(
-                self.valid_dataloader
+            logits, labels, val_metrics, val_epoch_loss = self.evaluate(
+                self.val_dataloader
             )
             self._current_epoch += 1
             self._current_epoch_train_loss = trn_epoch_loss
-            self._current_epoch_valid_loss = val_epoch_loss
-            self._current_valid_metrics.update(valid_metrics)
+            self._current_epoch_val_loss = val_epoch_loss
+            self._current_val_metrics.update(val_metrics)
             self._log_epoch_summary()
 
     def _train_startup_log_msg(self):
@@ -322,9 +322,9 @@ class Trainer:
 
     def _log_epoch_summary(self):
         metrics_summary = []
-        for m, v in self._current_valid_metrics.items():
-            tmp_str = f"valid_{m}: {v:.4f}"
+        for m, v in self._current_val_metrics.items():
+            tmp_str = f"val_{m}: {v:.4f}"
             metrics_summary.append(tmp_str)
         metrics_summary = "  |  ".join(metrics_summary)
-        summary_str = f"  Epoch {self._current_epoch}  |  train_loss: {self._current_epoch_train_loss:.4f}  |  valid_loss: {self._current_epoch_valid_loss:.4f}  |  {metrics_summary}"
+        summary_str = f"  Epoch {self._current_epoch}  |  train_loss: {self._current_epoch_train_loss:.4f}  |  val_loss: {self._current_epoch_val_loss:.4f}  |  {metrics_summary}"
         self.accelerator.print(summary_str)
