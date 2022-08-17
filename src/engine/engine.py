@@ -79,9 +79,6 @@ class Trainer:
         - Or you can simply pass the dataloaders and this trainer will use those without constructing on its own.
         """
 
-        # model should be instantiated before accelerator init
-        # as on TPU it may load this model on all processes
-        # and RAM may explode!
         self.model = model
         self.optimizer = optimizer
         self.args = args
@@ -91,7 +88,6 @@ class Trainer:
         # dataset
         self.train_dataset = train_dataset
         self.valid_dataset = valid_dataset
-
         # sampler
         self.train_sampler = train_sampler
         self.valid_sampler = valid_sampler
@@ -132,56 +128,65 @@ class Trainer:
             )
 
         # math around schedulers
-        if isinstance(self.args.num_warmup_steps, float):
-            num_warmup_steps = self.args.num_warmup_steps * len(self.train_dataloader)
-        elif isinstance(self.args.num_warmup_steps, int):
-            num_warmup_steps = self.args.num_warmup_steps
-        num_warmup_steps = math.ceil(num_warmup_steps)
-        num_update_steps_per_epoch = math.ceil(
+        self.num_update_steps_per_epoch = math.ceil(
             len(self.train_dataloader) / self.args.gradient_accumulation_steps
         )
+        # total training/optimization steps
+        self.num_train_steps = (
+            self.args.num_train_epochs * self.num_update_steps_per_epoch
+        )
 
-        self.num_train_steps = num_update_steps_per_epoch * self.args.num_train_epochs
-
+        # total warmup steps
+        if isinstance(self.args.num_warmup_steps, float):
+            self.args.num_warmup_steps = math.ceil(
+                self.args.num_warmup_steps * self.num_train_steps
+            )
+        # define linear/cosine scheduler
         if self.args.scheduler_type == "cosine":
             self.lr_scheduler = get_cosine_schedule_with_warmup(
                 self.optimizer,
-                num_warmup_steps=num_warmup_steps,
+                num_warmup_steps=self.args.num_warmup_steps,
                 num_training_steps=self.num_train_steps,
             )
 
         elif self.args.scheduler_type == "linear":
             self.lr_scheduler = get_linear_schedule_with_warmup(
                 self.optimizer,
-                num_warmup_steps=num_warmup_steps,
+                num_warmup_steps=self.args.num_warmup_steps,
                 num_training_steps=self.num_train_steps,
             )
-            # prepare for distributed training aka put everything in HF Accelerate
-            (
-                self.model,
-                self.optimizer,
-                self.train_dataloader,
-                self.valid_dataloader,
-                self.lr_scheduler,
-            ) = self.accelerator.prepare(
-                self.model,
-                self.optimizer,
-                self.train_dataloader,
-                self.valid_dataloader,
-                self.lr_scheduler,
-            )
 
-            # We need to recalculate our total training steps as the size of the training dataloader may have changed.
-            num_update_steps_per_epoch = math.ceil(
-                len(self.train_dataloader) / self.args.gradient_accumulation_steps
-            )
-            self.num_train_steps = (
-                self.args.num_train_epochs * num_update_steps_per_epoch
-            )
-            # Afterwards we recalculate our number of training epochs
-            self.args.num_train_epochs = math.ceil(
-                self.num_train_steps / num_update_steps_per_epoch
-            )
+        # prepare for distributed training aka put everything in 🤗 Accelerate 🚀
+        (
+            self.model,
+            self.optimizer,
+            self.train_dataloader,
+            self.valid_dataloader,
+            self.lr_scheduler,
+        ) = self.accelerator.prepare(
+            self.model,
+            self.optimizer,
+            self.train_dataloader,
+            self.valid_dataloader,
+            self.lr_scheduler,
+        )
+
+        # re-calculate total training steps and epoch as the size of the training dataloader may have changed.
+        self.num_update_steps_per_epoch = math.ceil(
+            len(self.train_dataloader) / self.args.gradient_accumulation_steps
+        )
+        self.num_train_steps = (
+            self.args.num_train_epochs * self.num_update_steps_per_epoch
+        )
+        self.args.num_train_epochs = math.ceil(
+            self.num_train_steps / self.num_update_steps_per_epoch
+        )
+
+        self.total_batch_size = (
+            self.args.per_device_train_batch_size
+            * self.accelerator.is_main_process
+            * self.args.gradient_accumulation_steps
+        )
 
     def _init_accelerator(self, *args, **kwargs):
         self.accelerator = Accelerator(
@@ -199,73 +204,31 @@ class Trainer:
             disable=not self.accelerator.is_main_process,
         )
 
-    def train_one_step(self, batch):
-        with self.accelerator.accumulate(self.model):
+    def train_one_epoch(self, dataloader):
+        """
+        Trains the model for one epoch and return the average loss
+        Note: the model must return the loss from its forward function
+        """
+        self.model.train()
+        total_loss = 0
 
-            _, loss = self.model(**batch)
+        for step, batch in enumerate(self.train_dataloader):
+            with self.accelerator.accumulate(self.model):
+                logits, loss = self.model(**batch)
+                total_loss += loss.detach().float()
             self.accelerator.backward(loss)
-
             self.optimizer.step()
             self.lr_scheduler.step()
             self.optimizer.zero_grad()
 
-            # Checks if the accelerator has performed an optimization step behind the scenes
         if self.accelerator.sync_gradients:
-            self.global_prog_bar.set_postfix(loss=loss.item())
             self.global_prog_bar.update(1)
 
-        return loss
-
-    def train_one_epoch(self, dataloader):
-        total_loss = 0.0
-        self.model.train()
-        for batch_idx, batch in enumerate(dataloader):
-            loss = self.train_one_step(batch)
-            total_loss += loss.detach().float()
-
-        avg_loss = total_loss.item() / len(dataloader)
-        return avg_loss
-
-    @torch.no_grad()
-    def evaluate_one_step(self, batch):
-        model_out, loss = self.model(**batch)
-        labels = batch["label"]
-        return model_out, loss, labels
+        return total_loss.item() / len(self.train_dataloader)
 
     @torch.no_grad()
     def evaluate(self, dataloader):
-        """
-        Model forward method (from the model class) can return anything you want in the dictionary format or just a single output vector
-        The reason for supporting the dictionary format is if any advance processing of the multiple outputs is required by
-        the `compute_metrics` for calculation of metrics.
-        """
-        # TODO: add support for doing only evaluation by just loading the model state
-        all_model_outs = []
-        all_labels = []
-        print("In evaluation loop")
-        total_loss = 0.0
-        eval_pbar = tqdm(
-            range(len(dataloader)),
-            disable=self.accelerator.is_main_process,
-            leave=False,
-        )
-        self.model.eval()
-        for batch_idx, batch in enumerate(dataloader):
-            model_out, loss, labels = self.evaluate_one_step(batch)
-
-            model_out = self.accelerator.gather_for_metrics(model_out)
-            all_model_outs.append(model_out.cpu().numpy())
-            loss, labels = self.accelerator.gather_for_metrics((loss, labels))
-            total_loss += loss
-
-            all_labels.append(labels.cpu().numpy())
-            eval_pbar.update(1)
-        eval_pbar.close()
-        avg_loss = total_loss / len(dataloader)
-        all_model_outs = np.concatenate(all_model_outs)
-        all_labels = np.concatenate(all_labels)
-        metrics = self.compute_metrics(all_model_outs, all_labels)
-        return all_model_outs, all_labels, metrics
+        pass
 
     def save_model(self, weights_only: Optional[bool] = False, **kwargs):
         # make sure to handle distributed case here
@@ -280,28 +243,4 @@ class Trainer:
         pass
 
     def fit(self):
-        self._train_startup_log()
-        self._init_global_progress_bar()
-        for _ in range(self.args.num_train_epochs):
-            trn_epoch_loss = self.train_one_epoch(self.train_dataloader)
-            val_outs = self.evaluate(self.valid_dataloader)
-
-    def _train_startup_log(self):
-        total_batch_size = (
-            self.args.per_device_train_batch_size
-            * self.accelerator.num_processes
-            * self.args.gradient_accumulation_steps
-        )
-        self.accelerator.print("***** Running training *****")
-        self.accelerator.print(f"  Num examples = {len(self.train_dataset)}")
-        self.accelerator.print(f"  Num Epochs = {self.args.num_train_epochs}")
-        self.accelerator.print(
-            f"  Instantaneous batch size per device = {self.args.per_device_train_batch_size}"
-        )
-        self.accelerator.print(
-            f"  Total train batch size (w. parallel, distributed & accumulation) = {total_batch_size}"
-        )
-        self.accelerator.print(
-            f"  Gradient Accumulation steps = {self.args.gradient_accumulation_steps}"
-        )
-        self.accelerator.print(f"  Total optimization steps = {self.num_train_steps}")
+        pass
