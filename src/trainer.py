@@ -9,6 +9,7 @@ from typing import Callable, Optional, Union
 
 import numpy as np
 import torch
+from torch.nn.utils import clip_grad_norm_
 from accelerate import Accelerator
 from torch.utils.data import DataLoader, Dataset, Sampler
 from tqdm.auto import tqdm
@@ -19,7 +20,7 @@ from transformers import (
 
 """
 TODO:
-[ ] Print evaluation metrics nicely after each epoch
+[x] Print valuation metrics nicely after each epoch
 [ ] Add clip_grad_norm to training loop
 [ ] Add Weights & Biases logging (handle with care in distributed settings
 [ ] Add saving and loading of model checkpoint (handle with care in distributed settings)
@@ -43,7 +44,7 @@ class TrainerArguments:
 
     num_train_epochs: Optional[int] = 5
     gradient_accumulation_steps: Optional[int] = 1
-    clip_grad_norm: Optional[float] = None
+    max_grad_norm: Optional[float] = 1.0
     num_workers: Optional[int] = -1
     mixed_precision: Optional[str] = None  # bf16, fp16
 
@@ -240,6 +241,7 @@ class Trainer:
                 logits, loss = self.model(**batch)
                 total_loss += loss.detach().float()
             self.accelerator.backward(loss)
+            clip_grad_norm_(self.model.parameters(), self.args.max_grad_norm)
             self.optimizer.step()
             self.lr_scheduler.step()
             self.optimizer.zero_grad()
@@ -253,16 +255,16 @@ class Trainer:
         return total_loss.item() / len(dataloader)
 
     @torch.no_grad()
-    def evaluate(self, dataloader):
+    def valuate(self, dataloader):
         all_logits = []
         all_labels = []
         total_loss = 0
-        eval_pbar = tqdm(
+        val_pbar = tqdm(
             range(len(dataloader)),
             disable=not self.accelerator.is_main_process,
             leave=False,
         )
-        self.model.eval()
+        self.model.val()
         for step, batch in enumerate(dataloader):
             logits, loss = self.model(**batch)
             total_loss += loss.item()
@@ -270,14 +272,14 @@ class Trainer:
             all_labels.append(
                 self.accelerator.gather_for_metrics(batch["label"].cpu().numpy())
             )
-            eval_pbar.update(1)
-        eval_pbar.close()
+            val_pbar.update(1)
+        val_pbar.close()
         all_logits = np.concatenate(all_logits)
         all_labels = np.concatenate(all_labels)
 
-        eval_metrics = self.compute_metrics(all_logits, all_labels)
+        val_metrics = self.compute_metrics(all_logits, all_labels)
         avg_loss = total_loss / len(dataloader)
-        return all_logits, all_labels, eval_metrics, avg_loss
+        return all_logits, all_labels, val_metrics, avg_loss
 
     def save_model(self, weights_only: Optional[bool] = False, **kwargs):
         # make sure to handle distributed case here
@@ -296,7 +298,7 @@ class Trainer:
         self._init_global_progress_bar()
         for epoch in range(self.args.num_train_epochs):
             trn_epoch_loss = self.train_one_epoch(self.train_dataloader)
-            logits, labels, val_metrics, val_epoch_loss = self.evaluate(
+            logits, labels, val_metrics, val_epoch_loss = self.valuate(
                 self.val_dataloader
             )
             self._current_epoch += 1
