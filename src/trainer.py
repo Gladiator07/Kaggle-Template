@@ -12,15 +12,7 @@ import torch
 from torch.nn.utils import clip_grad_norm_
 from accelerate import Accelerator
 from torch.utils.data import DataLoader, Dataset, Sampler
-from tqdm import tqdm as tqdm_base
-
-
-def tqdm(*args, **kwargs):
-    if hasattr(tqdm_base, "_instances"):
-        for instance in list(tqdm_base._instances):
-            tqdm_base._decr_instances(instance)
-    return tqdm_base(*args, **kwargs)
-
+from tqdm.auto import tqdm
 
 from transformers import (
     get_cosine_schedule_with_warmup,
@@ -38,10 +30,10 @@ TODO:
 [ ] Add option to choose between print to console or log to a file
 [ ] Add a `final_summary` method which will print the complete summary per epoch (losses and metrics) in a table form
 [ ] Add helpful print/log messages while training
-[ ] Test the code thoroughly with multi-GPU setup
-[ ] Test the code thoroughly with TPU setup 
 [ ] Maybe wrap up the math around scheduler in a private method
 [ ] Add log_every_n_steps functionality (maybe to reduce bottlenecks while on TPUs)
+[ ] Test the code thoroughly with multi-GPU setup
+[ ] Test the code thoroughly with TPU setup 
 [ ] Add type hints
 [ ] Add docstrings 😛
 """
