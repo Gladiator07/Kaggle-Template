@@ -1,45 +1,17 @@
 # Inspired and modified from: https://github.com/abhishekkrthakur/tez
 
-from dataclasses import dataclass
 import multiprocessing
-from typing import Optional, Union
-from xml.sax import parseString
+from dataclasses import dataclass
+from typing import Callable, Optional, Union
 
 import torch
-from torch.utils.data import DataLoader, Dataset
 from accelerate import Accelerator
+from torch.utils.data import DataLoader, Dataset
+from tqdm.auto import tqdm
 from transformers import (
     get_cosine_schedule_with_warmup,
     get_linear_schedule_with_warmup,
 )
-from tqdm.auto import tqdm
-
-
-class AverageMeter:
-    """
-    Computes and stores the average and current value
-    """
-
-    def __init__(self):
-        self.val = 0
-        self.avg = 0
-        self.sum = 0
-        self.count = 0
-
-    def reset(self):
-        self.val = 0
-        self.avg = 0
-        self.sum = 0
-        self.count = 0
-
-    def update(self, val, n=1):
-        self.val = val
-        self.sum += val * n
-        self.count += n
-        self.avg = self.sum / self.count
-
-    def __repr__(self) -> str:
-        return f"AverageMeter(val={self.val}, avg={self.avg}, sum={self.sum}, count={self.count})"
 
 
 @dataclass
@@ -79,6 +51,7 @@ class TrainerArguments:
 ------
 DESIGN
 ------
+[ ] For now just building a simple trainer that can train and evaluate per epoch and has a `compute_metrics` function for calculating custom metrics [without any callback system]
 [x] Create dataloaders internally by `TrainerArguments` and passed dataset classes (add collate_fn, shuffle, etc, basically all parameters accepted by Dataloader)
 [x] Whether dataloaders should be created internally or should be provided as args ??? [Decide on this]
 [] `log_mode`: choose whether to log everything to a log file or just print to stdout
@@ -107,9 +80,9 @@ GOTCHAS
 class Trainer:
     def __init__(
         self,
+        args: Optional[TrainerArguments],
         model: torch.nn.Module,
         optimizer: torch.optim,  # passing from outside for now to have the flexibility to modify param groups
-        args: Optional[TrainerArguments],
     ):
 
         self.model = model
@@ -130,14 +103,23 @@ class Trainer:
         self,
         train_dataset: Optional[Dataset],
         valid_dataset: Optional[Dataset],
+        compute_metrics: Optional[Callable] = None,
         **kwargs,
     ):
+        self._init_accelerator()
+        # dataset
         self.train_dataset = train_dataset
         self.valid_dataset = valid_dataset
+        # dataloader
+        self.train_dataloader = kwargs.get("train_dataloader", None)
+        self.valid_dataloader = kwargs.get("valid_dataloader", None)
+        # sampler
         self.train_sampler = kwargs.get("train_sampler", None)
         self.valid_sampler = kwargs.get("valid_sampler", None)
+        # collate fns
         self.train_collate_fn = kwargs.get("train_collate_fn", None)
         self.valid_collate_fn = kwargs.get("valid_collate_fn", None)
+        self.compute_metrics = compute_metrics
 
         if self.args.num_workers == -1:
             self.args.num_workers = multiprocessing.cpu_count()
@@ -188,7 +170,7 @@ class Trainer:
 
         # now calculate total training steps as prepare method may change its length
         if isinstance(self.args.num_warmup_steps, float):
-            num_warmup_steps = 0.1 * len(self.train_dataloader)
+            num_warmup_steps = self.args.num_warmup_steps * len(self.train_dataloader)
         elif isinstance(self.args.num_warmup_steps, int):
             num_warmup_steps = self.args.num_warmup_steps
 
@@ -208,77 +190,75 @@ class Trainer:
                 num_training_steps=num_training_steps,
             )
 
-        self.progress_bar = tqdm(
+        self.global_prog_bar = tqdm(
             range(self.args.num_train_epochs * len(self.train_dataloader)),
             disable=not self.accelerator.is_main_process,
         )
 
-    def set_train_epoch_start(self, dataloader):
-        try:
-            self.train_loader_bs = dataloader.batch_sampler.batch_size
-        except AttributeError:
-            self.train_loader_bs = dataloader._loader.batch_sampler.batch_size
-        self.model.train()
-
-    def train_one_step(self, data):
+    def train_one_step(self, batch):
         with self.accelerator.accumulate(self.model):
-            _, loss = self.model(**data)
+            _, loss = self.model(**batch)
             self.accelerator.backward(loss)
             self.optimizer.step()
             self.lr_scheduler.step()
             self.optimizer.zero_grad()
-            self.progress_bar.update(1)
+            self.global_prog_bar.update(1)
         return loss
 
     def train_one_epoch(self, dataloader):
-        # set start of training epoch (maybe when enums are implemented)
-        self.set_training_epoch_start(dataloader)
-        losses = AverageMeter()
-        for batch_idx, data in enumerate(dataloader):
-            loss = self.train_one_step(data)
-            # TODO: check difference between gather and this stuff
-            losses = losses.update(
-                loss.item() * self.config.gradient_accumulation_steps,
-                self.train_loader_bs,
-            )
+        total_loss = 0.0
+        self.model.train()
+        for batch_idx, batch in enumerate(dataloader):
+            loss = self.train_one_step(batch)
+            total_loss += loss.detach().float()
 
-        return losses.avg
+        avg_loss = total_loss.item() / len(dataloader)
+        return avg_loss
 
-    def train(self, train_dataset: Dataset, valid_dataset: Dataset, **kwargs):
-        self._init_trainer(train_dataset, valid_dataset)
-
-        for _ in range(self.args.num_train_epochs):
-            trn_epoch_loss = self.train_one_epoch(self.train_dataloader)
-
-            # TODO: add a check for val strategy as epoch
-
-    def set_validation_epoch_start(self, dataloader):
-        try:
-            self.valid_loader_bs = dataloader.batch_sampler.batch_size
-        except AttributeError:
-            self.valid_loader_bs = dataloader._loader.batch_sampler.batch_size
-        self.model.eval()
-
-    def predict_step(self, data):
-        _, loss = self.model(data)
-        return loss
+    @torch.no_grad()
+    def evaluate_one_step(self, batch):
+        logits, _ = self.model(**batch)
+        labels = batch["label"]
+        return logits, labels
 
     @torch.no_grad()
     def evaluate(self, dataloader):
-        self.set_validation_epoch_start()
-        losses = AverageMeter()
-        for batch_index, data in enumerate(dataloader):
-            loss = self.predict_step(data)
-        losses.update(loss.item(), self.valid_loader_bs)
+        # TODO: add support for doing only evaluation
+        # by just loading the model state
+        all_logits = []
+        all_labels = []
+        eval_pbar = tqdm(
+            range(len(dataloader)),
+            disable=self.accelerator.is_main_process,
+            leave=False,
+        )
+        self.model.eval()
+        for batch_idx, batch in enumerate(dataloader):
+            logits, labels = self.evaluate_one_step(batch)
+            logits, labels = self.accelerator.gather_for_metrics((logits, labels))
+            all_logits.append(logits.cpu().numpy())
+            all_labels.append(labels.cpu().numpy())
+            eval_pbar.update(1)
+        eval_pbar.close()
+        metrics = self.compute_metrics(all_logits, all_labels)
 
-    def save_model(self, weights_only: Optional[False], **kwargs):
+        return all_logits, all_labels, metrics
+
+    def save_model(self, weights_only: Optional[bool] = False, **kwargs):
         # make sure to handle distributed case here
         pass
 
-    def load_model(self, weights_only: Optional[False], **kwargs):
+    def load_model(self, weights_only: Optional[bool] = False, **kwargs):
         # make sure to handle distributed case here
         pass
 
     def predict(self, **kwargs):
         # make sure to handle distributed case here
         pass
+
+    def fit(self, train_dataset: Dataset, valid_dataset: Dataset, **kwargs):
+        self._init_trainer(train_dataset, valid_dataset, **kwargs)
+
+        for _ in range(self.args.num_train_epochs):
+            trn_epoch_loss = self.train_one_epoch(self.train_dataloader)
+            val_outs = self.evaluate(self.valid_dataloader)
