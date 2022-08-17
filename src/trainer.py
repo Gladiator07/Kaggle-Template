@@ -12,7 +12,16 @@ import torch
 from torch.nn.utils import clip_grad_norm_
 from accelerate import Accelerator
 from torch.utils.data import DataLoader, Dataset, Sampler
-from tqdm.auto import tqdm
+from tqdm import tqdm as tqdm_base
+
+
+def tqdm(*args, **kwargs):
+    if hasattr(tqdm_base, "_instances"):
+        for instance in list(tqdm_base._instances):
+            tqdm_base._decr_instances(instance)
+    return tqdm_base(*args, **kwargs)
+
+
 from transformers import (
     get_cosine_schedule_with_warmup,
     get_linear_schedule_with_warmup,
@@ -228,8 +237,10 @@ class Trainer:
 
     def _init_global_progress_bar(self):
         self.global_prog_bar = tqdm(
-            range(self.args.num_train_epochs * len(self.train_dataloader)),
+            range(self.num_train_steps),
             disable=not self.accelerator.is_main_process,
+            position=0,
+            leave=True,
         )
 
     def train_one_epoch(self, dataloader):
@@ -376,4 +387,5 @@ class Trainer:
             metrics_summary.append(tmp_str)
         metrics_summary = "  |  ".join(metrics_summary)
         summary_str = f"  Epoch {self._current_epoch}  |  train_loss: {self._current_epoch_train_loss:.4f}  |  val_loss: {self._current_epoch_val_loss:.4f}  |  {metrics_summary}"
-        self.accelerator.print(summary_str)
+        if self.accelerator.is_main_process:
+            self.global_prog_bar.write(summary_str)
