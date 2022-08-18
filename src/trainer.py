@@ -176,9 +176,7 @@ class Trainer:
         self.num_update_steps_per_epoch = math.ceil(
             len(self.train_dataloader) / self.args.gradient_accumulation_steps
         )
-        self.num_train_steps = (
-            self.args.num_train_epochs * self.num_update_steps_per_epoch
-        )
+        self.num_train_steps = self.args.num_train_epochs * self.num_update_steps_per_epoch
         self.args.num_train_epochs = math.ceil(
             self.num_train_steps / self.num_update_steps_per_epoch
         )
@@ -194,9 +192,7 @@ class Trainer:
             * self.args.gradient_accumulation_steps
         )
         # set learning rate scheduler
-        self.lr_scheduler = self._set_scheduler(
-            self.args.num_warmup_steps, self.num_train_steps
-        )
+        self.lr_scheduler = self._set_scheduler(self.args.num_warmup_steps, self.num_train_steps)
 
     def _init_accelerator(self, *args, **kwargs):
         self.accelerator = Accelerator(
@@ -216,19 +212,15 @@ class Trainer:
         if self.args.scheduler_type == "cosine":
             lr_scheduler = get_cosine_schedule_with_warmup(
                 self.optimizer,
-                num_warmup_steps=num_warmup_steps
-                * self.args.gradient_accumulation_steps,
-                num_training_steps=num_train_steps
-                * self.args.gradient_accumulation_steps,
+                num_warmup_steps=num_warmup_steps * self.args.gradient_accumulation_steps,
+                num_training_steps=num_train_steps * self.args.gradient_accumulation_steps,
             )
 
         elif self.args.scheduler_type == "linear":
             lr_scheduler = get_linear_schedule_with_warmup(
                 self.optimizer,
-                num_warmup_steps=num_warmup_steps
-                * self.args.gradient_accumulation_steps,
-                num_training_steps=num_train_steps
-                * self.args.gradient_accumulation_steps,
+                num_warmup_steps=num_warmup_steps * self.args.gradient_accumulation_steps,
+                num_training_steps=num_train_steps * self.args.gradient_accumulation_steps,
             )
         return lr_scheduler
 
@@ -254,9 +246,7 @@ class Trainer:
                 self.accelerator.backward(loss)
                 # assuming dataset has label as key
                 self._trn_loss_meter.update(loss.item(), batch["label"])
-                self.accelerator.clip_grad_norm_(
-                    self.model.parameters(), self.args.max_grad_norm
-                )
+                self.accelerator.clip_grad_norm_(self.model.parameters(), self.args.max_grad_norm)
                 self.optimizer.step()
                 self.lr_scheduler.step()
                 self.optimizer.zero_grad()
@@ -284,9 +274,7 @@ class Trainer:
             logits, loss = self.model(**batch)
             self._val_loss_meter.update(loss.item(), batch["label"])
             all_logits.append(self.accelerator.gather_for_metrics(logits).cpu().numpy())
-            all_labels.append(
-                self.accelerator.gather_for_metrics(batch["label"]).cpu().numpy()
-            )
+            all_labels.append(self.accelerator.gather_for_metrics(batch["label"]).cpu().numpy())
             val_pbar.update(1)
         val_pbar.close()
         all_logits = np.concatenate(all_logits)
@@ -337,9 +325,7 @@ class Trainer:
         best_val_metric = 0
         for epoch in range(self.args.num_train_epochs):
             trn_epoch_loss = self.train_one_epoch(self.train_dataloader)
-            logits, labels, val_metrics, val_epoch_loss = self.evaluate(
-                self.val_dataloader
-            )
+            logits, labels, val_metrics, val_epoch_loss = self.evaluate(self.val_dataloader)
             self._current_epoch += 1
             self._current_epoch_train_loss = trn_epoch_loss
             self._current_epoch_val_loss = val_epoch_loss
@@ -348,13 +334,8 @@ class Trainer:
 
             # save best epoch model
             if self.args.save_best_checkpoint:
-                if (
-                    self._current_val_metrics[self.args.metric_for_best_model]
-                    > best_val_metric
-                ):
-                    best_val_metric = self._current_val_metrics[
-                        self.args.metric_for_best_model
-                    ]
+                if self._current_val_metrics[self.args.metric_for_best_model] > best_val_metric:
+                    best_val_metric = self._current_val_metrics[self.args.metric_for_best_model]
                     self.save_model(
                         path=os.path.join(self.args.output_dir, "best_model.pth"),
                         weights_only=self.args.save_weights_only,
