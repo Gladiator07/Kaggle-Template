@@ -23,9 +23,8 @@ from utils import AverageMeter
 TODO:
 [x] Print valuation metrics nicely after each epoch
 [x] Add clip_grad_norm to training loop
-[ ] Make sure that loss calculated is correct
+[x] Make sure that loss calculated is correct
 [ ] Add Weights & Biases logging (handle with care in distributed settings
-[ ] Add gather_for_metrics for validation loss to get correct loss. 
 [ ] Handle tie and untie model weights in case of TPU
 [x] Add saving and loading of model checkpoint (handle with care in distributed settings)
 [ ] Check optimization stuff (total training steps, accumulation , lr scheduler)
@@ -118,6 +117,7 @@ class Trainer:
         self._current_epoch_train_loss = 0.0
         self._current_epoch_val_loss = 0.0
         self._current_val_metrics = {}
+        self._best_val_metric = 0
         self._init_accelerator()
 
         # dataset
@@ -168,23 +168,18 @@ class Trainer:
             self.optimizer,
             self.train_dataloader,
             self.val_dataloader,
-        ) = self.accelerator.prepare(
-            self.model, self.optimizer, self.train_dataloader, self.val_dataloader
-        )
+        ) = self.accelerator.prepare(self.model, self.optimizer, self.train_dataloader, self.val_dataloader)
+
+        # TODO: handle weight tying of model after pushed to XLA device here
+        # https://github.com/pytorch/xla/blob/master/TROUBLESHOOTING.md#xla-tensor-quirks
 
         # re-calculate total training steps and epoch as the size of the training dataloader may have changed.
-        self.num_update_steps_per_epoch = math.ceil(
-            len(self.train_dataloader) / self.args.gradient_accumulation_steps
-        )
+        self.num_update_steps_per_epoch = math.ceil(len(self.train_dataloader) / self.args.gradient_accumulation_steps)
         self.num_train_steps = self.args.num_train_epochs * self.num_update_steps_per_epoch
-        self.args.num_train_epochs = math.ceil(
-            self.num_train_steps / self.num_update_steps_per_epoch
-        )
+        self.args.num_train_epochs = math.ceil(self.num_train_steps / self.num_update_steps_per_epoch)
 
         if isinstance(self.args.num_warmup_steps, float):
-            self.args.num_warmup_steps = math.ceil(
-                self.args.num_warmup_steps * self.num_train_steps
-            )
+            self.args.num_warmup_steps = math.ceil(self.args.num_warmup_steps * self.num_train_steps)
 
         self.total_batch_size = (
             self.args.per_device_train_batch_size
@@ -198,9 +193,7 @@ class Trainer:
         self.accelerator = Accelerator(
             device_placement=True,
             step_scheduler_with_optimizer=False,
-            mixed_precision=self.args.mixed_precision
-            if self.args.mixed_precision is not None
-            else "no",
+            mixed_precision=self.args.mixed_precision if self.args.mixed_precision is not None else "no",
             gradient_accumulation_steps=self.args.gradient_accumulation_steps,
         )
 
@@ -245,7 +238,7 @@ class Trainer:
                 logits, loss = self.model(**batch)
                 self.accelerator.backward(loss)
                 # assuming dataset has label as key
-                self._trn_loss_meter.update(loss.item(), batch["label"])
+                self._trn_loss_meter.update(loss.item(), batch["label"].size(0))
                 self.accelerator.clip_grad_norm_(self.model.parameters(), self.args.max_grad_norm)
                 self.optimizer.step()
                 self.lr_scheduler.step()
@@ -272,7 +265,7 @@ class Trainer:
         self.model.eval()
         for step, batch in enumerate(dataloader):
             logits, loss = self.model(**batch)
-            self._val_loss_meter.update(loss.item(), batch["label"])
+            self._val_loss_meter.update(loss.item(), batch["label"].size(0))
             all_logits.append(self.accelerator.gather_for_metrics(logits).cpu().numpy())
             all_labels.append(self.accelerator.gather_for_metrics(batch["label"]).cpu().numpy())
             val_pbar.update(1)
@@ -309,9 +302,7 @@ class Trainer:
         if weights_only:
             self.accelerator.unwrap_model(self.model).load_state_dict(model_state_dict)
         else:
-            self.accelerator.unwrap_model(self.model).load_state_dict(
-                model_state_dict["state_dict"]
-            )
+            self.accelerator.unwrap_model(self.model).load_state_dict(model_state_dict["state_dict"])
             self.optimizer.load_state_dict(model_state_dict["optimizer"])
 
     def predict(self, **kwargs):
@@ -322,7 +313,7 @@ class Trainer:
         self._train_startup_log_msg()
         self._init_global_progress_bar()
         best_loss = -np.inf
-        best_val_metric = 0
+        self.best_val_metric = 0
         for epoch in range(self.args.num_train_epochs):
             trn_epoch_loss = self.train_one_epoch(self.train_dataloader)
             logits, labels, val_metrics, val_epoch_loss = self.evaluate(self.val_dataloader)
@@ -334,8 +325,9 @@ class Trainer:
 
             # save best epoch model
             if self.args.save_best_checkpoint:
-                if self._current_val_metrics[self.args.metric_for_best_model] > best_val_metric:
-                    best_val_metric = self._current_val_metrics[self.args.metric_for_best_model]
+                metric_value_for_best_model = self._current_val_metrics[self.args.metric_for_best_model]
+                if metric_value_for_best_model > self.best_val_metric:
+                    self.best_val_metric = metric_value_for_best_model
                     self.save_model(
                         path=os.path.join(self.args.output_dir, "best_model.pth"),
                         weights_only=self.args.save_weights_only,
@@ -354,15 +346,11 @@ class Trainer:
         self.accelerator.print("***** Running training *****")
         self.accelerator.print(f"  Num examples = {len(self.train_dataset)}")
         self.accelerator.print(f"  Num Epochs = {self.args.num_train_epochs}")
-        self.accelerator.print(
-            f"  Instantaneous batch size per device = {self.args.per_device_train_batch_size}"
-        )
+        self.accelerator.print(f"  Instantaneous batch size per device = {self.args.per_device_train_batch_size}")
         self.accelerator.print(
             f"  Total train batch size (w. parallel, distributed & accumulation) = {self.total_batch_size}"
         )
-        self.accelerator.print(
-            f"  Gradient Accumulation steps = {self.args.gradient_accumulation_steps}"
-        )
+        self.accelerator.print(f"  Gradient Accumulation steps = {self.args.gradient_accumulation_steps}")
         self.accelerator.print(f"  Num warmup steps = {self.args.num_warmup_steps}")
         self.accelerator.print(f"  Total optimization steps = {self.num_train_steps}")
 
