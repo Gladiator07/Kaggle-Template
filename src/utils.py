@@ -7,9 +7,7 @@ import slack
 import torch
 
 
-def set_seed(
-    seed: int = 42, deterministic: bool = False, benchmark: bool = False
-) -> None:
+def set_seed(seed: int = 42, deterministic: bool = False, benchmark: bool = False) -> None:
     os.environ["PYTHONHASHSEED"] = str(seed)
     np.random.seed(seed)
     random.seed(seed)
@@ -58,3 +56,16 @@ class SlackNotifier:
 
     def notify(self, message: str):
         self.client.chat_postMessage(channel=self.channel, text=message)
+
+
+def asHours(seconds: float) -> str:
+    """
+    Returns seconds to human-readable formatted string
+    Args:
+        seconds (float): total seconds
+    Returns:
+        str: total seconds converted to human-readable formatted string
+    """
+    m, s = divmod(seconds, 60)
+    h, m = divmod(m, 60)
+    return f"{h:.0f}h:{m:.0f}m:{s:.0f}s"

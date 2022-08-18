@@ -4,6 +4,7 @@
 
 import gc
 import math
+import time
 import os
 from dataclasses import dataclass
 from typing import Callable, Dict, Optional, Union
@@ -15,7 +16,7 @@ from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 from transformers import get_cosine_schedule_with_warmup, get_linear_schedule_with_warmup
 
-from utils import AverageMeter
+from utils import AverageMeter, asHours
 
 """
 TODO:
@@ -113,6 +114,7 @@ class Trainer:
         self._trn_loss_meter = AverageMeter("train_loss", ":.4e")
         self._val_loss_meter = AverageMeter("val_loss", ":.4e")
         self._current_epoch = 0
+        self._epoch_time = 0
         self._current_epoch_train_loss = 0.0
         self._current_epoch_val_loss = 0.0
         self._current_val_metrics = {}
@@ -205,6 +207,7 @@ class Trainer:
         Trains the model for one epoch and return the average loss
         Note: the model must return the loss from its forward function
         """
+
         self._trn_loss_meter.reset()
         self.model.train()
 
@@ -213,7 +216,8 @@ class Trainer:
                 self.optimizer.zero_grad()
                 _, loss = self.model(**batch)
                 self._accelerator.backward(loss)
-                self._accelerator.clip_grad_norm_(self.model.parameters(), self.args.max_grad_norm)
+                if self._accelerator.sync_gradients:
+                    self._accelerator.clip_grad_norm_(self.model.parameters(), self.args.max_grad_norm)
                 self.optimizer.step()
                 self.lr_scheduler.step()
                 # assuming dataset has label as key
@@ -263,13 +267,13 @@ class Trainer:
         self._init_global_progress_bar()
         self.best_val_metric = 0
         for epoch in range(self.args.num_train_epochs):
+            epoch_start_time = time.time()
             trn_epoch_loss = self.train_one_epoch(self.train_dataloader)
             eval_outs = self.evaluate(self.val_dataloader)
             self._current_epoch += 1
             self._current_val_metrics.update(eval_outs.metrics)
             self._current_epoch_train_loss = trn_epoch_loss
             self._current_epoch_val_loss = eval_outs.loss
-            self._log_epoch_summary()
 
             # save best model
             if self.args.save_best_checkpoint:
@@ -281,6 +285,9 @@ class Trainer:
                         weights_only=self.args.save_weights_only,
                     )
             self._gentle_cleanup()
+
+            self._epoch_time = asHours(time.time() - epoch_start_time)
+            self._log_epoch_summary()
 
         self.global_prog_bar.close()
         # save last model
@@ -320,7 +327,7 @@ class Trainer:
             logits, _ = self.model(**batch)
             all_logits.append(self._accelerator.gather_for_metrics(logits).cpu().numpy())
             predict_pbar.update(1)
-
+        predict_pbar.close()
         all_logits = np.concatenate(all_logits)
         return all_logits
 
@@ -356,12 +363,23 @@ class Trainer:
         self._accelerator.print(f"  Total optimization steps = {self.num_train_steps}")
 
     def _log_epoch_summary(self):
+        sepr = "  |  "
         metrics_summary = []
         for m, v in self._current_val_metrics.items():
             tmp_str = f"val_{m}: {v:.4f}"
             metrics_summary.append(tmp_str)
-        metrics_summary = "  |  ".join(metrics_summary)
-        summary_str = f"  Epoch {self._current_epoch}  |  train_loss: {self._current_epoch_train_loss:.4f}  |  val_loss: {self._current_epoch_val_loss:.4f}  |  {metrics_summary}"
+        metrics_summary = f"{sepr}".join(metrics_summary)
+        summary_str = (
+            f"  Epoch {self._current_epoch}"
+            + sepr
+            + f"train_loss: {self._current_epoch_train_loss:.4f}"
+            + sepr
+            + f"val_loss: {self._current_epoch_val_loss:.4f}"
+            + sepr
+            + metrics_summary
+            + sepr
+            + f"time: {self._epoch_time}"
+        )
         if self._accelerator.is_main_process:
             self.global_prog_bar.write(summary_str)
 
