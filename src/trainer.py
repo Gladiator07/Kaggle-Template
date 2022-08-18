@@ -24,6 +24,7 @@ TODO:
 [x] Print valuation metrics nicely after each epoch
 [x] Add clip_grad_norm to training loop
 [x] Make sure that loss calculated is correct
+[ ] Maybe pass even the dataloaders to the class to keep the class simple and less cluttered
 [ ] Add Weights & Biases logging (handle with care in distributed settings
 [ ] Handle tie and untie model weights in case of TPU
 [x] Add saving and loading of model checkpoint (handle with care in distributed settings)
@@ -98,39 +99,55 @@ For now no plan to make it fully generalizable, just copy paste this file and mo
 
 @dataclass
 class Trainer:
-
-    model: torch.nn.Module  # model is required
-    args: TrainerArguments = None  # args is required
-    optimizer: torch.optim = None  # passing from outside for now to have the flexibility to modify param groups
-    train_dataset: Optional[Dataset] = None
-    val_dataset: Optional[Dataset] = None
-    test_dataset: Optional[Dataset] = None
-    train_sampler: Optional[Sampler] = None
-    val_sampler: Optional[Sampler] = None
-    test_sampler: Optional[Sampler] = None
-    train_collate_fn: Optional[Callable] = None
-    val_collate_fn: Optional[Callable] = None
-    test_collate_fn: Optional[Callable] = None
-    train_dataloader: Optional[DataLoader] = None
-    val_dataloader: Optional[DataLoader] = None
-    test_dataloader: Optional[DataLoader] = None
-    compute_metrics: Optional[Callable] = None
-
-    """
-    - Either pass train_dataset, val_dataset and trainer will create dataloader on its own.
-    - If you want special samplers and collate functions then you can pass them too and they will be assigned to dataloader.
-    - Or you can simply pass the dataloaders and this trainer will use those without constructing on its own.
-    """
-
-    # internals
-    _trn_loss_meter = AverageMeter("train_loss", ":.4e")
-    _val_loss_meter = AverageMeter("val_loss", ":.4e")
-    _current_epoch = 0
-    _current_epoch_train_loss = 0.0
-    _current_epoch_val_loss = 0.0
-    _current_val_metrics = {}
-    _best_val_metric = 0
-    _accelerator = None
+    def __init__(
+        self,
+        model: torch.nn.Module,  # model is required
+        args: TrainerArguments = None,  # args is required
+        optimizer: torch.optim = None,  # passing from outside for now to have the flexibility to modify param groups
+        train_dataset: Optional[Dataset] = None,
+        val_dataset: Optional[Dataset] = None,
+        test_dataset: Optional[Dataset] = None,
+        train_sampler: Optional[Sampler] = None,
+        val_sampler: Optional[Sampler] = None,
+        test_sampler: Optional[Sampler] = None,
+        train_collate_fn: Optional[Callable] = None,
+        val_collate_fn: Optional[Callable] = None,
+        test_collate_fn: Optional[Callable] = None,
+        train_dataloader: Optional[DataLoader] = None,
+        val_dataloader: Optional[DataLoader] = None,
+        test_dataloader: Optional[DataLoader] = None,
+        compute_metrics: Optional[Callable] = None,
+    ):
+        """
+        - Either pass train_dataset, val_dataset and trainer will create dataloader on its own.
+        - If you want special samplers and collate functions then you can pass them too and they will be assigned to dataloader.
+        - Or you can simply pass the dataloaders and this trainer will use those without constructing on its own.
+        """
+        self.model = model
+        self.args = args
+        self.optimizer = optimizer
+        self.train_dataset = train_dataset
+        self.val_dataset = val_dataset
+        self.test_dataset = test_dataset
+        self.train_sampler = train_sampler
+        self.val_sampler = val_sampler
+        self.test_sampler = test_sampler
+        self.train_collate_fn = train_collate_fn
+        self.val_collate_fn = val_collate_fn
+        self.test_collate_fn = test_collate_fn
+        self.train_dataloader = train_dataloader
+        self.val_dataloader = val_dataloader
+        self.test_dataloader = test_dataloader
+        self.compute_metrics = compute_metrics
+        # internals
+        self._trn_loss_meter = AverageMeter("train_loss", ":.4e")
+        self._val_loss_meter = AverageMeter("val_loss", ":.4e")
+        self._current_epoch = 0
+        self._current_epoch_train_loss = 0.0
+        self._current_epoch_val_loss = 0.0
+        self._current_val_metrics = {}
+        self._best_val_metric = 0
+        self._accelerator = None
 
     def _init_accelerator(self, *args, **kwargs):
         """
@@ -154,6 +171,7 @@ class Trainer:
         Initialize trainer for training and evaluation routines
         """
         self._set_num_workers()
+        self._init_accelerator()
         # if not provided then create dataloaders from datasets/samplers/collate_fns
         if self.train_dataloader is None and self.train_dataset is not None:
             self.train_dataloader = DataLoader(
@@ -239,7 +257,6 @@ class Trainer:
         Trains the model for one epoch and return the average loss
         Note: the model must return the loss from its forward function
         """
-        self._init_trainer()
         self._trn_loss_meter.reset()
         self.model.train()
 
@@ -314,7 +331,7 @@ class Trainer:
             raise Exception("Either test dataset or test dataloader not found")
         if self.test_dataloader is None:
             self.test_dataloader = DataLoader(
-                self.test_dataloader,
+                self.test_dataset,
                 batch_size=self.args.per_device_val_batch_size,
                 shuffle=self.args.test_shuffle,
                 collate_fn=self.test_collate_fn,
@@ -333,7 +350,7 @@ class Trainer:
             range(len(self.test_dataloader)), disable=not self._accelerator.is_main_process, desc="Running Prediction"
         )
         all_logits = []
-        for step, batch in len(self.test_dataloader):
+        for step, batch in self.test_dataloader:
             logits, _ = self.model(**batch)
             all_logits.append(self._accelerator.gather_for_metrics(logits).cpu().numpy())
             predict_pbar.update(1)
@@ -342,6 +359,7 @@ class Trainer:
         return all_logits
 
     def fit(self):
+        self._init_trainer()
         self._train_startup_log_msg()
         self._init_global_progress_bar()
         best_loss = -np.inf
