@@ -23,7 +23,10 @@ from transformers import (
 TODO:
 [x] Print valuation metrics nicely after each epoch
 [x] Add clip_grad_norm to training loop
+[ ] Make sure that loss calculated is correct
 [ ] Add Weights & Biases logging (handle with care in distributed settings
+[ ] Add gather_for_metrics for validation loss to get correct loss. 
+[ ] Handle tie and untie model weights in case of TPU
 [x] Add saving and loading of model checkpoint (handle with care in distributed settings)
 [ ] Check optimization stuff (total training steps, accumulation , lr scheduler)
 [ ] Add a predict method which can perform prediction from loading a model state. Example: `trainer.predict(test_dataset, **kwargs)`
@@ -248,7 +251,9 @@ class Trainer:
                 logits, loss = self.model(**batch)
                 total_loss += loss.detach().float()
                 self.accelerator.backward(loss)
-                clip_grad_norm_(self.model.parameters(), self.args.max_grad_norm)
+                self.accelerator.clip_grad_norm_(
+                    self.model.parameters(), self.args.max_grad_norm
+                )
                 self.optimizer.step()
                 self.lr_scheduler.step()
                 self.optimizer.zero_grad()
