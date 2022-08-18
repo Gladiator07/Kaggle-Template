@@ -1,23 +1,23 @@
 # Inspired from HuggingFace Trainer and Tez
 # https://huggingface.co/docs/transformers/main_classes/trainer
 # https://github.com/abhishekkrthakur/tez
-import os
 import math
 import multiprocessing
+import os
 from dataclasses import dataclass
 from typing import Callable, Optional, Union
 
 import numpy as np
 import torch
-from torch.nn.utils import clip_grad_norm_
 from accelerate import Accelerator
 from torch.utils.data import DataLoader, Dataset, Sampler
 from tqdm.auto import tqdm
-
 from transformers import (
     get_cosine_schedule_with_warmup,
     get_linear_schedule_with_warmup,
 )
+
+from utils import AverageMeter
 
 """
 TODO:
@@ -112,6 +112,8 @@ class Trainer:
         self.args = args
 
         # internals
+        self._trn_loss_meter = AverageMeter("train_loss", ":.4e")
+        self._val_loss_meter = AverageMeter("val_loss", ":.4e")
         self._current_epoch = 0
         self._current_epoch_train_loss = 0.0
         self._current_epoch_val_loss = 0.0
@@ -243,14 +245,15 @@ class Trainer:
         Trains the model for one epoch and return the average loss
         Note: the model must return the loss from its forward function
         """
+        self._trn_loss_meter.reset()
         self.model.train()
-        total_loss = 0
 
         for step, batch in enumerate(dataloader):
             with self.accelerator.accumulate(self.model):
                 logits, loss = self.model(**batch)
-                total_loss += loss.detach().float()
                 self.accelerator.backward(loss)
+                # assuming dataset has label as key
+                self._trn_loss_meter.update(loss.item(), batch["label"])
                 self.accelerator.clip_grad_norm_(
                     self.model.parameters(), self.args.max_grad_norm
                 )
@@ -259,18 +262,18 @@ class Trainer:
                 self.optimizer.zero_grad()
 
                 if self.accelerator.sync_gradients:
-                    self.global_prog_bar.set_postfix(loss=loss.item())
+                    self.global_prog_bar.set_postfix(loss=self._trn_loss_meter.avg)
                     self.global_prog_bar.update(1)
 
         # can also calculate metrics here for training epoch via `compute_metrics` Callable function
         # ...
-        return total_loss.item() / len(dataloader)
+        return self._trn_loss_meter.avg
 
     @torch.no_grad()
     def evaluate(self, dataloader):
         all_logits = []
         all_labels = []
-        total_loss = 0
+        self._val_loss_meter.reset()
         val_pbar = tqdm(
             range(len(dataloader)),
             disable=not self.accelerator.is_main_process,
@@ -279,7 +282,7 @@ class Trainer:
         self.model.eval()
         for step, batch in enumerate(dataloader):
             logits, loss = self.model(**batch)
-            total_loss += loss.item()
+            self._val_loss_meter.update(loss.item(), batch["label"])
             all_logits.append(self.accelerator.gather_for_metrics(logits).cpu().numpy())
             all_labels.append(
                 self.accelerator.gather_for_metrics(batch["label"]).cpu().numpy()
@@ -290,8 +293,8 @@ class Trainer:
         all_labels = np.concatenate(all_labels)
 
         val_metrics = self.compute_metrics(all_logits, all_labels)
-        avg_loss = total_loss / len(dataloader)
-        return all_logits, all_labels, val_metrics, avg_loss
+
+        return all_logits, all_labels, val_metrics, self._val_loss_meter.avg
 
     def save_model(self, path: str, weights_only: Optional[bool] = False, **kwargs):
         self.accelerator.wait_for_everyone()
