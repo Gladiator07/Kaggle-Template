@@ -424,3 +424,4 @@ class Trainer:
 
     def _full_cleanup(self):
         self.accelerator.clear()
+        gc.collect()
