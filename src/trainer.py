@@ -92,7 +92,7 @@ class Trainer:
         # passing from outside for now to have the flexibility to modify param groups
         optimizer: torch.optim = None,
         # 🤗 `accelerator` can be passed to the class if 🤗 `accelerator` if initialized at the start of the train script.
-        # If not passed will be initialzed internally by the `Trainer`.
+        # If not passed will be initialized internally by the `Trainer`.
         # Recommended way is to initialize the accelerator at the start of the main train script
         # and pass as an argument to this class
         accelerator: Optional[Accelerator] = None,
@@ -120,18 +120,20 @@ class Trainer:
         self._trn_loss_meter = AverageMeter("train_loss", ":.4e")
         self._val_loss_meter = AverageMeter("val_loss", ":.4e")
         self._current_epoch = 0
+        self._completed_steps = 0
         self._epoch_time = 0
         self._current_epoch_train_loss = 0.0
         self._current_epoch_val_loss = 0.0
         self._current_val_metrics = {}
         self._best_val_metric = 0
-        self._accelerator = accelerator
+        self.accelerator = accelerator
+        self._wandb = self.args.log_to_wandb
 
     def _init_accelerator(self, *args, **kwargs):
         """
         Initialize the 🤗 Accelerator
         """
-        self._accelerator = Accelerator(
+        self.accelerator = Accelerator(
             device_placement=True,
             step_scheduler_with_optimizer=False,
             mixed_precision=self.args.mixed_precision if self.args.mixed_precision is not None else "no",
@@ -150,7 +152,7 @@ class Trainer:
         self.per_device_train_batch_size = self.train_dataloader.batch_size
         self.total_samples = len(self.train_dataloader.dataset)
 
-        if self._accelerator is not None:
+        if self.accelerator is not None:
             self._init_accelerator()
 
         # not putting any checks if train_dataloader or val_dataloader is present or not
@@ -162,7 +164,7 @@ class Trainer:
             self.optimizer,
             self.train_dataloader,
             self.val_dataloader,
-        ) = self._accelerator.prepare(self.model, self.optimizer, self.train_dataloader, self.val_dataloader)
+        ) = self.accelerator.prepare(self.model, self.optimizer, self.train_dataloader, self.val_dataloader)
 
         # TODO: handle weight tying of model after pushed to XLA device here
         # https://github.com/pytorch/xla/blob/master/TROUBLESHOOTING.md#xla-tensor-quirks
@@ -176,14 +178,14 @@ class Trainer:
             self.args.num_warmup_steps = math.ceil(self.args.num_warmup_steps * self.num_train_steps)
 
         self.total_batch_size = (
-            self.per_device_train_batch_size * self._accelerator.num_processes * self.args.gradient_accumulation_steps
+            self.per_device_train_batch_size * self.accelerator.num_processes * self.args.gradient_accumulation_steps
         )
         # set learning rate scheduler
         self.lr_scheduler = self._set_scheduler(self.args.num_warmup_steps, self.num_train_steps)
 
     def _set_scheduler(self, num_warmup_steps, num_train_steps):
         """
-        Call after `_accelerator.prepare`
+        Call after `accelerator.prepare`
         """
         # define linear/cosine scheduler
         if self.args.scheduler_type == "cosine":
@@ -204,7 +206,7 @@ class Trainer:
     def _init_global_progress_bar(self):
         self.global_prog_bar = tqdm(
             range(self.num_train_steps),
-            disable=not self._accelerator.is_main_process,
+            disable=not self.accelerator.is_main_process,
             position=0,
             leave=True,
         )
@@ -219,22 +221,23 @@ class Trainer:
         self.model.train()
 
         for step, batch in enumerate(dataloader):
-            with self._accelerator.accumulate(self.model):
+            with self.accelerator.accumulate(self.model):
                 self.optimizer.zero_grad()
                 _, loss = self.model(**batch)
-                self._accelerator.backward(loss)
-                if self._accelerator.sync_gradients:
-                    self._accelerator.clip_grad_norm_(self.model.parameters(), self.args.max_grad_norm)
+                self.accelerator.backward(loss)
+                if self.accelerator.sync_gradients:
+                    self.accelerator.clip_grad_norm_(self.model.parameters(), self.args.max_grad_norm)
                 self.optimizer.step()
                 self.lr_scheduler.step()
                 # assuming dataset has label as key
-                step_loss_gathered = self._accelerator.gather(loss).mean().item()
+                step_loss_gathered = self.accelerator.gather(loss).mean().item()
                 self._trn_loss_meter.update(
                     step_loss_gathered * self.args.gradient_accumulation_steps, batch["label"].size(0)
                 )
-                if self._accelerator.sync_gradients:
+                if self.accelerator.sync_gradients:
                     self.global_prog_bar.set_postfix(loss=self._trn_loss_meter.avg)
                     self.global_prog_bar.update(1)
+                    self._completed_steps += 1
 
         # can also calculate metrics here for training epoch via `compute_metrics` Callable function
         # ...
@@ -247,17 +250,17 @@ class Trainer:
         self._val_loss_meter.reset()
         val_pbar = tqdm(
             range(len(dataloader)),
-            disable=not self._accelerator.is_main_process,
+            disable=not self.accelerator.is_main_process,
             leave=False,
             desc="Running Validation",
         )
         self.model.eval()
         for step, batch in enumerate(dataloader):
             logits, loss = self.model(**batch)
-            step_loss_gathered = self._accelerator.gather(loss).mean().item()
+            step_loss_gathered = self.accelerator.gather(loss).mean().item()
             self._val_loss_meter.update(step_loss_gathered, batch["label"].size(0))
-            all_logits.append(self._accelerator.gather_for_metrics(logits).cpu().numpy())
-            all_labels.append(self._accelerator.gather_for_metrics(batch["label"]).cpu().numpy())
+            all_logits.append(self.accelerator.gather_for_metrics(logits).cpu().numpy())
+            all_labels.append(self.accelerator.gather_for_metrics(batch["label"]).cpu().numpy())
             val_pbar.update(1)
         val_pbar.close()
         all_logits = np.concatenate(all_logits)
@@ -317,43 +320,43 @@ class Trainer:
                 "`.predict()` method requires a dataloader, either pass it through the `.predict()` method or while initiating the `Trainer` class"
             )
 
-        if self._accelerator is not None:
+        if self.accelerator is not None:
             # unwrap the model if distributed training `.fit()` was performed before calling `.predict()`
             # TODO: following line can introduce bug if accelerator is passed from outside
             # check this once
-            self.model = self._accelerator.unwrap_model(self.model)
-            self._accelerator = None
+            self.model = self.accelerator.unwrap_model(self.model)
+            self.accelerator = None
 
         # reinit accelerator
         self._init_accelerator()
 
         # load model
-        if self._accelerator.is_main_process:
+        if self.accelerator.is_main_process:
             model_dict = torch.load(checkpoint_path, map_location="cpu")
             self.model.load_state_dict(model_dict)
 
         # init and prepare accelerator
-        self.model, self.test_dataloader = self._accelerator.prepare(self.model, self.test_dataloader)
+        self.model, self.test_dataloader = self.accelerator.prepare(self.model, self.test_dataloader)
         self.model.eval()
 
         predict_pbar = tqdm(
-            range(len(self.test_dataloader)), disable=not self._accelerator.is_main_process, desc="Running Prediction"
+            range(len(self.test_dataloader)), disable=not self.accelerator.is_main_process, desc="Running Prediction"
         )
         all_logits = []
         for step, batch in enumerate(self.test_dataloader):
             logits, _ = self.model(**batch)
-            all_logits.append(self._accelerator.gather_for_metrics(logits).cpu().numpy())
+            all_logits.append(self.accelerator.gather_for_metrics(logits).cpu().numpy())
             predict_pbar.update(1)
         predict_pbar.close()
         all_logits = np.concatenate(all_logits)
         return all_logits
 
     def save_model(self, path: str, weights_only: Optional[bool] = False):
-        self._accelerator.wait_for_everyone()
-        model_state_dict = self._accelerator.unwrap_model(self.model).state_dict()
+        self.accelerator.wait_for_everyone()
+        model_state_dict = self.accelerator.unwrap_model(self.model).state_dict()
         if weights_only:
-            if self._accelerator.is_main_process:
-                self._accelerator.save(model_state_dict, path)
+            if self.accelerator.is_main_process:
+                self.accelerator.save(model_state_dict, path)
             return
         model_dict = {}
         model_dict["state_dict"] = model_state_dict
@@ -361,23 +364,23 @@ class Trainer:
         model_dict["scheduler"] = self.lr_scheduler.state_dict()
         model_dict["args"] = self.args
 
-        if self._accelerator.is_main_process:
-            self._accelerator.save(
+        if self.accelerator.is_main_process:
+            self.accelerator.save(
                 model_dict,
                 path,
             )
 
     def _train_startup_log_msg(self):
-        self._accelerator.print("***** Running training *****")
-        self._accelerator.print(f"  Num Samples = {self.total_samples}")
-        self._accelerator.print(f"  Num Epochs = {self.args.num_train_epochs}")
-        self._accelerator.print(f"  Instantaneous batch size per device = {self.per_device_train_batch_size}")
-        self._accelerator.print(
+        self.accelerator.print("***** Running training *****")
+        self.accelerator.print(f"  Num Samples = {self.total_samples}")
+        self.accelerator.print(f"  Num Epochs = {self.args.num_train_epochs}")
+        self.accelerator.print(f"  Instantaneous batch size per device = {self.per_device_train_batch_size}")
+        self.accelerator.print(
             f"  Total train batch size (w. parallel, distributed & accumulation) = {self.total_batch_size}"
         )
-        self._accelerator.print(f"  Gradient Accumulation steps = {self.args.gradient_accumulation_steps}")
-        self._accelerator.print(f"  Num warmup steps = {self.args.num_warmup_steps}")
-        self._accelerator.print(f"  Total optimization steps = {self.num_train_steps}")
+        self.accelerator.print(f"  Gradient Accumulation steps = {self.args.gradient_accumulation_steps}")
+        self.accelerator.print(f"  Num warmup steps = {self.args.num_warmup_steps}")
+        self.accelerator.print(f"  Total optimization steps = {self.num_train_steps}")
 
     def _log_epoch_summary(self):
         sepr = " | "
@@ -397,11 +400,11 @@ class Trainer:
             + sepr
             + f"time: {self._epoch_time}"
         )
-        if self._accelerator.is_main_process:
+        if self.accelerator.is_main_process:
             self.global_prog_bar.write(summary_str)
 
     def _gentle_cleanup(self):
         gc.collect()
 
     def _full_cleanup(self):
-        self._accelerator.clear()
+        self.accelerator.clear()
