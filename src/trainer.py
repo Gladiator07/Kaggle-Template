@@ -68,9 +68,7 @@ class TrainerArguments:
     num_warmup_steps: Optional[Union[float, int]] = 0.1
 
     # misc
-    log_to_wandb: Optional[bool] = False
     log_every_n_steps: Optional[int] = 10
-    log_mode: Optional[bool] = "print"  # log
     save_best_checkpoint: Optional[bool] = True
     save_last_checkpoint: Optional[bool] = True
     save_weights_only: Optional[bool] = True
@@ -91,10 +89,6 @@ class Trainer:
         args: TrainerArguments = None,  # args is required
         # passing from outside for now to have the flexibility to modify param groups
         optimizer: torch.optim = None,
-        # 🤗 `accelerator` can be passed to the class if 🤗 `accelerator` if initialized at the start of the train script.
-        # If not passed will be initialized internally by the `Trainer`.
-        # Recommended way is to initialize the accelerator at the start of the main train script
-        # and pass as an argument to this class
         accelerator: Optional[Accelerator] = None,
         train_dataloader: Optional[DataLoader] = None,
         val_dataloader: Optional[DataLoader] = None,
@@ -102,9 +96,13 @@ class Trainer:
         compute_metrics: Optional[Callable] = None,
     ):
         """
-        - Either pass train_dataset, val_dataset and trainer will create dataloader on its own.
-        - If you want special samplers and collate functions then you can pass them too and they will be assigned to dataloader.
-        - Or you can simply pass the dataloaders and this trainer will use those without constructing on its own.
+        NOTE:
+        🤗 `accelerator` should be initialized at the start of the `main` function or train script
+        and then passed to the initialization of this class. This design decision is made because
+        dataset preparation/logging will be done multiple times on all cores in distributed settings (especially on TPUs).
+        To have the flexibility of doing it on the main process, accelerator should be initialized at the start of the training script.
+        Also, logging to wandb is more convenient as wandb can be initialized at the start of the script to capture all of the logs
+        and not have to wait until `trainer.fit()`
         """
 
         self.model = model
@@ -117,6 +115,9 @@ class Trainer:
         self.compute_metrics = compute_metrics
 
         # internals
+        self.best_val_metric = 0
+        self.accelerator = accelerator
+
         self._trn_loss_meter = AverageMeter("train_loss", ":.4e")
         self._val_loss_meter = AverageMeter("val_loss", ":.4e")
         self._current_epoch = 0
@@ -125,13 +126,15 @@ class Trainer:
         self._current_epoch_train_loss = 0.0
         self._current_epoch_val_loss = 0.0
         self._current_val_metrics = {}
-        self._best_val_metric = 0
-        self.accelerator = accelerator
-        self._wandb = self.args.log_to_wandb
+        if self.accelerator is not None:
+            self._wandb = True if self.accelerator.log_with != [] else False
 
     def _init_accelerator(self, *args, **kwargs):
         """
-        Initialize the 🤗 Accelerator
+        Initializes the 🤗 Accelerator
+        Note: Only use this in `.predict()` method, not intended to be used in `.fit()`
+        For training/evaluation accelerator should be passed from outside
+        Might remove this for `.predict() method too in the future
         """
         self.accelerator = Accelerator(
             device_placement=True,
@@ -144,7 +147,7 @@ class Trainer:
 
     def _init_trainer(self):
         """
-        Initialize trainer for training and evaluation
+        Initializes trainer for training and evaluation
         """
         # create output directory
         os.makedirs(self.args.output_dir, exist_ok=True)
@@ -152,8 +155,8 @@ class Trainer:
         self.per_device_train_batch_size = self.train_dataloader.batch_size
         self.total_samples = len(self.train_dataloader.dataset)
 
-        if self.accelerator is not None:
-            self._init_accelerator()
+        if self.accelerator is None:
+            raise Exception("🤗 Accelerator object not found, pass it to the class' init")
 
         # not putting any checks if train_dataloader or val_dataloader is present or not
         # as this method is explicitly used by `.fit()` which requires both dataloaders
@@ -229,7 +232,6 @@ class Trainer:
                     self.accelerator.clip_grad_norm_(self.model.parameters(), self.args.max_grad_norm)
                 self.optimizer.step()
                 self.lr_scheduler.step()
-                # assuming dataset has label as key
                 step_loss_gathered = self.accelerator.gather(loss).mean().item()
                 self._trn_loss_meter.update(
                     step_loss_gathered * self.args.gradient_accumulation_steps, batch["label"].size(0)
@@ -238,6 +240,14 @@ class Trainer:
                     self.global_prog_bar.set_postfix(loss=self._trn_loss_meter.avg)
                     self.global_prog_bar.update(1)
                     self._completed_steps += 1
+
+                    if self._wandb:
+                        # TODO: check with .avg
+                        self.accelerator.log({"train/loss": self._trn_loss_meter.val}, step=step)
+
+        # log average epoch loss
+        if self._wandb:
+            self.accelerator.log({"train/loss_epoch": self._trn_loss_meter.avg})
 
         # can also calculate metrics here for training epoch via `compute_metrics` Callable function
         # ...
@@ -267,7 +277,11 @@ class Trainer:
         all_labels = np.concatenate(all_labels)
 
         val_metrics = self.compute_metrics(all_logits, all_labels)
+        val_metrics = {f"val/{k}": v for k, v in val_metrics.items()}
 
+        if self._wandb:
+            self.accelerator.log({"val/loss": self._val_loss_meter.avg})
+            self.accelerator.log(**val_metrics)
         return EvalOutput(all_logits, all_labels, val_metrics, self._val_loss_meter.avg)
 
     def fit(self):
@@ -296,7 +310,7 @@ class Trainer:
                         path=os.path.join(self.args.output_dir, "best_model.bin"),
                         weights_only=self.args.save_weights_only,
                     )
-            self._gentle_cleanup()
+            self._cleanup()
 
             self._epoch_time = asHours(time.time() - epoch_start_time)
             self._log_epoch_summary()
@@ -327,6 +341,8 @@ class Trainer:
             self.model = self.accelerator.unwrap_model(self.model)
             self.accelerator = None
 
+        # turn off wandb for inference (generally this function is used offline on Kaggle)
+        self._wandb, self.args.log_to_wandb = False, False
         # reinit accelerator
         self._init_accelerator()
 
@@ -386,15 +402,15 @@ class Trainer:
         sepr = " | "
         metrics_summary = []
         for m, v in self._current_val_metrics.items():
-            tmp_str = f"val_{m}: {v:.4f}"
+            tmp_str = f"{m}: {v:.4f}"
             metrics_summary.append(tmp_str)
         metrics_summary = f"{sepr}".join(metrics_summary)
         summary_str = (
             f"  Epoch {self._current_epoch}"
             + sepr
-            + f"train_loss: {self._current_epoch_train_loss:.4f}"
+            + f"train/loss: {self._current_epoch_train_loss:.4f}"
             + sepr
-            + f"val_loss: {self._current_epoch_val_loss:.4f}"
+            + f"val/loss: {self._current_epoch_val_loss:.4f}"
             + sepr
             + metrics_summary
             + sepr
@@ -403,7 +419,7 @@ class Trainer:
         if self.accelerator.is_main_process:
             self.global_prog_bar.write(summary_str)
 
-    def _gentle_cleanup(self):
+    def _cleanup(self):
         gc.collect()
 
     def _full_cleanup(self):
