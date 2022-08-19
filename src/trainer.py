@@ -242,8 +242,7 @@ class Trainer:
                     self._completed_steps += 1
 
                     if self._wandb:
-                        # TODO: check with .avg
-                        self.accelerator.log({"train/loss": self._trn_loss_meter.val}, step=step)
+                        self.accelerator.log({"train/loss": self._trn_loss_meter.val}, step=self._completed_steps)
 
         # log average epoch loss
         if self._wandb:
@@ -281,7 +280,7 @@ class Trainer:
 
         if self._wandb:
             self.accelerator.log({"val/loss": self._val_loss_meter.avg})
-            self.accelerator.log(**val_metrics)
+            self.accelerator.log(val_metrics)
         return EvalOutput(all_logits, all_labels, val_metrics, self._val_loss_meter.avg)
 
     def fit(self):
