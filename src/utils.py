@@ -14,8 +14,6 @@ def set_seed(seed: int = 42, deterministic: bool = False, benchmark: bool = Fals
     torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.deterministic = deterministic
     torch.backends.cudnn.benchmark = benchmark
-    torch.use_deterministic_algorithms(deterministic, warn_only=True)
-    print(f"Global seed set to {seed}")
 
 
 class AverageMeter(object):
