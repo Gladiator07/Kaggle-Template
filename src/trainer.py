@@ -27,9 +27,9 @@ TODO:
 [x] Add saving and loading of model checkpoint (handle with care in distributed settings)
 [x] Maybe wrap up the math around scheduler in a private method
 [x] Add a predict method which can perform prediction from loading a model state. Example: `trainer.predict(path, dataloader)`
+[x] Check optimization stuff (total training steps, accumulation , lr scheduler)
 [ ] Add Weights & Biases logging (handle with care in distributed settings
-[ ] Check optimization stuff (total training steps, accumulation , lr scheduler)
-[ ] Add option to choose between print to console or log to a file
+[ ] Add option to choose between print to console or log to a file (this is not necessary I guess as wandb records all of the stdout)
 [ ] Add a `final_summary` method which will print/log the complete summary (best and last metric/loss scores, total time taken, etc, etc)
 [ ] Add log_every_n_steps functionality (maybe to reduce bottlenecks)
 [ ] Test the code thoroughly with multi-GPU setup
@@ -89,7 +89,13 @@ class Trainer:
         self,
         model: torch.nn.Module,  # model is required
         args: TrainerArguments = None,  # args is required
-        optimizer: torch.optim = None,  # passing from outside for now to have the flexibility to modify param groups
+        # passing from outside for now to have the flexibility to modify param groups
+        optimizer: torch.optim = None,
+        # 🤗 `accelerator` can be passed to the class if 🤗 `accelerator` if initialized at the start of the train script.
+        # If not passed will be initialzed internally by the `Trainer`.
+        # Recommended way is to initialize the accelerator at the start of the main train script
+        # and pass as an argument to this class
+        accelerator: Optional[Accelerator] = None,
         train_dataloader: Optional[DataLoader] = None,
         val_dataloader: Optional[DataLoader] = None,
         test_dataloader: Optional[DataLoader] = None,
@@ -119,7 +125,7 @@ class Trainer:
         self._current_epoch_val_loss = 0.0
         self._current_val_metrics = {}
         self._best_val_metric = 0
-        self._accelerator = None
+        self._accelerator = accelerator
 
     def _init_accelerator(self, *args, **kwargs):
         """
@@ -221,8 +227,9 @@ class Trainer:
                 self.optimizer.step()
                 self.lr_scheduler.step()
                 # assuming dataset has label as key
+                step_loss_gathered = self._accelerator.gather(loss).mean().item()
                 self._trn_loss_meter.update(
-                    loss.item() * self.args.gradient_accumulation_steps, batch["label"].size(0)
+                    step_loss_gathered * self.args.gradient_accumulation_steps, batch["label"].size(0)
                 )
                 if self._accelerator.sync_gradients:
                     self.global_prog_bar.set_postfix(loss=self._trn_loss_meter.avg)
@@ -246,7 +253,8 @@ class Trainer:
         self.model.eval()
         for step, batch in enumerate(dataloader):
             logits, loss = self.model(**batch)
-            self._val_loss_meter.update(loss.item(), batch["label"].size(0))
+            step_loss_gathered = self._accelerator.gather(loss).mean().item()
+            self._val_loss_meter.update(step_loss_gathered, batch["label"].size(0))
             all_logits.append(self._accelerator.gather_for_metrics(logits).cpu().numpy())
             all_labels.append(self._accelerator.gather_for_metrics(batch["label"]).cpu().numpy())
             val_pbar.update(1)
@@ -303,12 +311,18 @@ class Trainer:
     def predict(self, checkpoint_path: str, test_dataloader: Optional[DataLoader] = None):
         if test_dataloader is not None:
             self.test_dataloader = test_dataloader
-        if self.test_dataloader is None or test_dataloader is None:
+        if self.test_dataloader is None:
             raise Exception(
                 "`.predict()` method requires a dataloader, either pass it through the `.predict()` method or while initiating the `Trainer` class"
             )
-        if self._accelerator is None:
-            self._init_accelerator()
+
+        if self._accelerator is not None:
+            # unwrap the model if distributed training `.fit()` was performed before calling `.predict()`
+            self.model = self._accelerator.unwrap_model(self.model)
+            self._accelerator = None
+
+        # reinit accelerator
+        self._init_accelerator()
 
         # load model
         if self._accelerator.is_main_process:
@@ -363,7 +377,7 @@ class Trainer:
         self._accelerator.print(f"  Total optimization steps = {self.num_train_steps}")
 
     def _log_epoch_summary(self):
-        sepr = "  |  "
+        sepr = " | "
         metrics_summary = []
         for m, v in self._current_val_metrics.items():
             tmp_str = f"val_{m}: {v:.4f}"
@@ -387,4 +401,4 @@ class Trainer:
         gc.collect()
 
     def _full_cleanup(self):
-        self._accelerator.free_memory()
+        self._accelerator.clear()
