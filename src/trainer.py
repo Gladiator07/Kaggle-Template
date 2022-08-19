@@ -4,6 +4,7 @@
 
 import gc
 import math
+from pathlib import Path
 import time
 import os
 from dataclasses import dataclass
@@ -15,7 +16,6 @@ from accelerate import Accelerator
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 from transformers import get_cosine_schedule_with_warmup, get_linear_schedule_with_warmup
-
 from utils import AverageMeter, asHours
 
 """
@@ -79,14 +79,13 @@ For now no plan to make it fully generalizable, just copy paste this file and mo
 """
 
 
-@dataclass
 class Trainer:
     def __init__(
         self,
         model: torch.nn.Module,  # model is required
-        args: TrainerArguments = None,  # args is required
+        args: Optional[TrainerArguments] = None,
         # passing from outside for now to have the flexibility to modify param groups
-        optimizer: torch.optim = None,
+        optimizer: Optional[torch.optim.Optimizer] = None,
         accelerator: Optional[Accelerator] = None,
         train_dataloader: Optional[DataLoader] = None,
         val_dataloader: Optional[DataLoader] = None,
@@ -185,7 +184,7 @@ class Trainer:
         # set learning rate scheduler
         self.lr_scheduler = self._set_scheduler(self.args.num_warmup_steps, self.num_train_steps)
 
-    def _set_scheduler(self, num_warmup_steps, num_train_steps):
+    def _set_scheduler(self, num_warmup_steps: int, num_train_steps: int):
         """
         Call after `accelerator.prepare`
         """
@@ -252,7 +251,7 @@ class Trainer:
         return self._trn_loss_meter.avg
 
     @torch.no_grad()
-    def evaluate(self, dataloader):
+    def evaluate(self, dataloader: DataLoader):
         all_logits = []
         all_labels = []
         self._val_loss_meter.reset()
@@ -326,7 +325,7 @@ class Trainer:
         self._full_cleanup()
 
     @torch.no_grad()
-    def predict(self, checkpoint_path: str, test_dataloader: Optional[DataLoader] = None):
+    def predict(self, checkpoint_path: Union[str, Path], test_dataloader: Optional[DataLoader] = None):
         if test_dataloader is not None:
             self.test_dataloader = test_dataloader
         if self.test_dataloader is None:
@@ -367,7 +366,7 @@ class Trainer:
         all_logits = np.concatenate(all_logits)
         return all_logits
 
-    def save_model(self, path: str, weights_only: Optional[bool] = False):
+    def save_model(self, path: Union[str, Path], weights_only: Optional[bool] = False):
         self.accelerator.wait_for_everyone()
         model_state_dict = self.accelerator.unwrap_model(self.model).state_dict()
         if weights_only:
