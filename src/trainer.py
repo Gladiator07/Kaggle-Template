@@ -28,10 +28,8 @@ TODO:
 [x] Maybe wrap up the math around scheduler in a private method
 [x] Add a predict method which can perform prediction from loading a model state. Example: `trainer.predict(path, dataloader)`
 [x] Check optimization stuff (total training steps, accumulation , lr scheduler)
-[ ] Add Weights & Biases logging (handle with care in distributed settings
-[ ] Add option to choose between print to console or log to a file (this is not necessary I guess as wandb records all of the stdout)
-[ ] Add a `final_summary` method which will print/log the complete summary (best and last metric/loss scores, total time taken, etc, etc)
-[ ] Add log_every_n_steps functionality (maybe to reduce bottlenecks)
+[x] Add Weights & Biases logging (handle with care in distributed settings
+[x] Add a `final_summary` method which will print/log the complete summary (best and last metric/loss scores, total time taken, etc, etc)
 [ ] Test the code thoroughly with multi-GPU setup
 [ ] Test the code thoroughly with TPU setup
 [ ] Check the code completely once (if any mistakes, correct them)
@@ -123,6 +121,7 @@ class Trainer:
         self._current_epoch = 0
         self._completed_steps = 0
         self._epoch_time = 0
+        self._start_time = 0
         self._current_epoch_train_loss = 0.0
         self._current_epoch_val_loss = 0.0
         self._current_val_metrics = {}
@@ -287,6 +286,7 @@ class Trainer:
         """
         Main entry point of training and evaluation routines
         """
+        self._start_time = time.time()
         self._init_trainer()
         self._train_startup_log_msg()
         self._init_global_progress_bar()
@@ -322,6 +322,7 @@ class Trainer:
                 weights_only=self.args.save_weights_only,
             )
 
+        self._train_end_log_msg()
         self._full_cleanup()
 
     @torch.no_grad()
@@ -396,6 +397,10 @@ class Trainer:
         self.accelerator.print(f"  Gradient Accumulation steps = {self.args.gradient_accumulation_steps}")
         self.accelerator.print(f"  Num warmup steps = {self.args.num_warmup_steps}")
         self.accelerator.print(f"  Total optimization steps = {self.num_train_steps}")
+
+    def _train_end_log_msg(self):
+        total_elapsed_time = time.time() - self._start_time
+        self.accelerator.print(f"\n\n===== Training completed in {asHours(total_elapsed_time)} =====\n\n")
 
     def _log_epoch_summary(self):
         sepr = " | "
