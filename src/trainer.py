@@ -150,7 +150,8 @@ class Trainer:
         self.per_device_train_batch_size = self.train_dataloader.batch_size
         self.total_samples = len(self.train_dataloader.dataset)
 
-        self._init_accelerator()
+        if self._accelerator is not None:
+            self._init_accelerator()
 
         # not putting any checks if train_dataloader or val_dataloader is present or not
         # as this method is explicitly used by `.fit()` which requires both dataloaders
@@ -318,6 +319,8 @@ class Trainer:
 
         if self._accelerator is not None:
             # unwrap the model if distributed training `.fit()` was performed before calling `.predict()`
+            # TODO: following line can introduce bug if accelerator is passed from outside
+            # check this once
             self.model = self._accelerator.unwrap_model(self.model)
             self._accelerator = None
 
