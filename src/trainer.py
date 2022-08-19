@@ -30,7 +30,7 @@ TODO:
 [x] Check optimization stuff (total training steps, accumulation , lr scheduler)
 [x] Add Weights & Biases logging (handle with care in distributed settings
 [x] Add a `final_summary` method which will print/log the complete summary (best and last metric/loss scores, total time taken, etc, etc)
-[ ] Test the code thoroughly with multi-GPU setup
+[x] Test the code thoroughly with multi-GPU setup
 [ ] Test the code thoroughly with TPU setup
 [ ] Check the code completely once (if any mistakes, correct them)
 [ ] Add type hints
