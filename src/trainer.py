@@ -49,7 +49,6 @@ class EvalOutput:
     logits: np.ndarray
     labels: np.ndarray
     metrics: Dict[str, float]
-    loss: float
 
 
 @dataclass
