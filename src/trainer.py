@@ -271,6 +271,7 @@ class Trainer:
         )
         self.model.eval()
         for batch in dataloader:
+            batch = {k: v.to(self.accelerator.device) for k, v in batch.items()}
             logits, loss = self.model(**batch)
             step_loss_gathered = self.accelerator.gather(loss).mean().item()
             self._val_loss_meter.update(step_loss_gathered, batch["label"].size(0))
