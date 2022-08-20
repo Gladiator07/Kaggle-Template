@@ -316,7 +316,6 @@ class Trainer:
                         path=os.path.join(self.args.output_dir, "best_model.bin"),
                         weights_only=self.args.save_weights_only,
                     )
-            self._cleanup()
 
             self._epoch_time = asHours(time.time() - epoch_start_time)
             self._log_epoch_summary()
