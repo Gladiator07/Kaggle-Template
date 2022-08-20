@@ -2,20 +2,21 @@
 # https://huggingface.co/docs/transformers/main_classes/trainer
 # https://github.com/abhishekkrthakur/tez
 
+from typing import Callable, Dict, Optional, Union
+import os
 import gc
 import math
-from pathlib import Path
 import time
-import os
+from pathlib import Path
+from tqdm.auto import tqdm
 from dataclasses import dataclass
-from typing import Callable, Dict, Optional, Union
 
 import numpy as np
 import torch
 from accelerate import Accelerator
 from torch.utils.data import DataLoader
-from tqdm.auto import tqdm
 from transformers import get_cosine_schedule_with_warmup, get_linear_schedule_with_warmup
+
 from utils import AverageMeter, asHours
 
 """
@@ -94,11 +95,12 @@ class Trainer:
     ):
         """
         NOTE:
-        🤗 `accelerator` should be initialized at the start of the `main` function or train script
+        🤗 `accelerator` should be initialized at the start of the `main()` function or train script
         and then passed to the initialization of this class. This design decision is made because
         dataset preparation/logging will be done multiple times on all cores in distributed settings (especially on TPUs).
-        To have the flexibility of doing it on the main process, accelerator should be initialized at the start of the training script.
-        Also, logging to wandb is more convenient as wandb can be initialized at the start of the script to capture all of the logs
+        To have the flexibility of doing it on the main process and leveraging the functionalities of 🤗 Accelerate,
+        accelerator should be initialized at the start of the training script.
+        Also, logging to W&B is more convenient as it can be initialized at the start of the script to capture all console logs
         and not have to wait until `trainer.fit()`
         """
 
@@ -118,7 +120,7 @@ class Trainer:
         self._trn_loss_meter = AverageMeter("train_loss", ":.4e")
         self._val_loss_meter = AverageMeter("val_loss", ":.4e")
         self._current_epoch = 0
-        self._completed_steps = 0
+        self._global_step = 0
         self._epoch_time = 0
         self._start_time = 0
         self._current_epoch_train_loss = 0.0
@@ -154,7 +156,9 @@ class Trainer:
         self.total_samples = len(self.train_dataloader.dataset)
 
         if self.accelerator is None:
-            raise Exception("🤗 Accelerator object not found, pass it to the class' init")
+            raise Exception(
+                "🤗 Accelerator object not found, it is required while calling `.fit()` method, pass it to the class' init"
+            )
 
         # not putting any checks if train_dataloader or val_dataloader is present or not
         # as this method is explicitly used by `.fit()` which requires both dataloaders
@@ -170,7 +174,7 @@ class Trainer:
         # TODO: handle weight tying of model after pushed to XLA device here
         # https://github.com/pytorch/xla/blob/master/TROUBLESHOOTING.md#xla-tensor-quirks
 
-        # re-calculate total training steps and epoch as the size of the training dataloader may have changed.
+        # calculate total training steps
         self.num_update_steps_per_epoch = math.ceil(len(self.train_dataloader) / self.args.gradient_accumulation_steps)
         self.num_train_steps = self.args.num_train_epochs * self.num_update_steps_per_epoch
         self.args.num_train_epochs = math.ceil(self.num_train_steps / self.num_update_steps_per_epoch)
@@ -186,9 +190,9 @@ class Trainer:
 
     def _set_scheduler(self, num_warmup_steps: int, num_train_steps: int):
         """
-        Call after `accelerator.prepare`
+        Call after `accelerator.prepare` and calculating the total train steps after `prepare`
         """
-        # define linear/cosine scheduler
+
         if self.args.scheduler_type == "cosine":
             lr_scheduler = get_cosine_schedule_with_warmup(
                 self.optimizer,
@@ -205,6 +209,9 @@ class Trainer:
         return lr_scheduler
 
     def _init_global_progress_bar(self):
+        """
+        Global Progress bar showing the progress of the complete training
+        """
         self.global_prog_bar = tqdm(
             range(self.num_train_steps),
             disable=not self.accelerator.is_main_process,
@@ -214,14 +221,14 @@ class Trainer:
 
     def train_one_epoch(self, dataloader: DataLoader):
         """
-        Trains the model for one epoch and return the average loss
+        Trains the model for one epoch and returns the average loss
         Note: the model must return the loss from its forward function
         """
 
         self._trn_loss_meter.reset()
         self.model.train()
 
-        for step, batch in enumerate(dataloader):
+        for batch in dataloader:
             with self.accelerator.accumulate(self.model):
                 self.optimizer.zero_grad()
                 _, loss = self.model(**batch)
@@ -237,10 +244,10 @@ class Trainer:
                 if self.accelerator.sync_gradients:
                     self.global_prog_bar.set_postfix(loss=self._trn_loss_meter.avg)
                     self.global_prog_bar.update(1)
-                    self._completed_steps += 1
+                    self._global_step += 1
 
                     if self._wandb:
-                        self.accelerator.log({"train/loss": self._trn_loss_meter.val}, step=self._completed_steps)
+                        self.accelerator.log({"train/loss": self._trn_loss_meter.val}, step=self._global_step)
 
         # log average epoch loss
         if self._wandb:
@@ -262,7 +269,7 @@ class Trainer:
             desc="Running Validation",
         )
         self.model.eval()
-        for step, batch in enumerate(dataloader):
+        for batch in dataloader:
             logits, loss = self.model(**batch)
             step_loss_gathered = self.accelerator.gather(loss).mean().item()
             self._val_loss_meter.update(step_loss_gathered, batch["label"].size(0))
