@@ -395,6 +395,7 @@ class Trainer:
 
     def _train_startup_log_msg(self):
         self.accelerator.print("***** Running training *****")
+        self.accelerator.print(f"  Mixed Precision = {self.args.mixed_precision}")
         self.accelerator.print(f"  Num Samples = {self.total_samples}")
         self.accelerator.print(f"  Num Epochs = {self.args.num_train_epochs}")
         self.accelerator.print(f"  Instantaneous batch size per device = {self.per_device_train_batch_size}")
