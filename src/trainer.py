@@ -210,7 +210,7 @@ class Trainer:
 
     def _init_global_progress_bar(self):
         """
-        Global Progress bar showing the progress of the complete training
+        Global Progress bar to show the progress of the complete training
         """
         self.global_prog_bar = tqdm(
             range(self.num_train_steps),
@@ -230,13 +230,14 @@ class Trainer:
 
         for batch in dataloader:
             with self.accelerator.accumulate(self.model):
-                self.optimizer.zero_grad()
+                self.optimizer.zero_grad(set_to_none=True)
                 _, loss = self.model(**batch)
                 self.accelerator.backward(loss)
                 if self.accelerator.sync_gradients:
                     self.accelerator.clip_grad_norm_(self.model.parameters(), self.args.max_grad_norm)
                 self.optimizer.step()
                 self.lr_scheduler.step()
+                # gather and average loss across all processes
                 step_loss_gathered = self.accelerator.gather(loss).mean().item()
                 self._trn_loss_meter.update(
                     step_loss_gathered * self.args.gradient_accumulation_steps, batch["label"].size(0)
@@ -348,7 +349,7 @@ class Trainer:
             self.accelerator = None
 
         # turn off wandb for inference (generally this function is used offline on Kaggle)
-        self._wandb, self.args.log_to_wandb = False, False
+        self._wandb = False
         # reinit accelerator
         self._init_accelerator()
 
@@ -365,7 +366,7 @@ class Trainer:
             range(len(self.test_dataloader)), disable=not self.accelerator.is_main_process, desc="Running Prediction"
         )
         all_logits = []
-        for step, batch in enumerate(self.test_dataloader):
+        for batch in self.test_dataloader:
             logits, _ = self.model(**batch)
             all_logits.append(self.accelerator.gather_for_metrics(logits).cpu().numpy())
             predict_pbar.update(1)
@@ -435,3 +436,4 @@ class Trainer:
     def _full_cleanup(self):
         self.accelerator.clear()
         gc.collect()
+        torch.cuda.empty_cache()
