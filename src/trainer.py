@@ -43,13 +43,12 @@ TODO:
 class EvalOutput:
     """
     A dataclass to store outputs from `Trainer.evaluate` method
-    Change this class and the method if you want to return something else
+    Change this class and the method if you want to return something else.
+    Output from these will be passed into `compute_metrics` function.
     """
 
     logits: np.ndarray
     labels: np.ndarray
-    metrics: Dict[str, float]
-    loss: float
 
 
 @dataclass
@@ -281,13 +280,7 @@ class Trainer:
         all_logits = np.concatenate(all_logits)
         all_labels = np.concatenate(all_labels)
 
-        val_metrics = self.compute_metrics(all_logits, all_labels)
-        val_metrics = {f"val/{k}": v for k, v in val_metrics.items()}
-
-        if self._wandb:
-            self.accelerator.log({"val/loss": self._val_loss_meter.avg})
-            self.accelerator.log(val_metrics)
-        return EvalOutput(all_logits, all_labels, val_metrics, self._val_loss_meter.avg)
+        return EvalOutput(all_logits, all_labels)
 
     def fit(self):
         """
@@ -305,7 +298,15 @@ class Trainer:
             self._current_epoch += 1
             self._current_val_metrics.update(eval_outs.metrics)
             self._current_epoch_train_loss = trn_epoch_loss
-            self._current_epoch_val_loss = eval_outs.loss
+            self._current_epoch_val_loss = self._val_loss_meter.avg
+
+            # calculate validation metrics
+            val_metrics = self.compute_metrics(eval_outs)
+            val_metrics = {f"val/{k}": v for k, v in val_metrics.items()}
+
+            if self._wandb:
+                self.accelerator.log({"val/loss": self._val_loss_meter.avg})
+                self.accelerator.log(val_metrics)
 
             # save best model
             if self.args.save_best_checkpoint:
