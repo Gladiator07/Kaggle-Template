@@ -148,7 +148,8 @@ class Trainer:
         if isinstance(self.args.num_warmup_steps, float):
             self.args.num_warmup_steps = math.ceil(self.args.num_warmup_steps * self.num_train_steps)
         self.lr_scheduler = self._set_scheduler(
-            num_warmup_steps=self.args.num_warmup_steps, num_train_steps=self.num_train_steps
+            num_warmup_steps=self.args.num_warmup_steps * self.args.gradient_accumulation_steps,
+            num_train_steps=self.num_train_steps * self.args.gradient_accumulation_steps,
         )
 
         # prepare for distributed training aka put everything in 🤗 Accelerate 🚀
@@ -165,13 +166,10 @@ class Trainer:
         # TODO: handle weight tying of model after pushed to XLA device here
         # https://github.com/pytorch/xla/blob/master/TROUBLESHOOTING.md#xla-tensor-quirks
 
-        # calculate total training steps
-        self.num_update_steps_per_epoch = math.ceil(len(self.train_dataloader) / self.args.gradient_accumulation_steps)
-        self.num_train_steps = self.args.num_train_epochs * self.num_update_steps_per_epoch
-        self.args.num_train_epochs = math.ceil(self.num_train_steps / self.num_update_steps_per_epoch)
-
-        if isinstance(self.args.num_warmup_steps, float):
-            self.args.num_warmup_steps = math.ceil(self.args.num_warmup_steps * self.num_train_steps)
+        # re-calculate total training steps
+        num_update_steps_per_epoch = math.ceil(len(self.train_dataloader) / self.args.gradient_accumulation_steps)
+        self.num_train_steps = self.args.num_train_epochs * num_update_steps_per_epoch
+        self.args.num_train_epochs = math.ceil(self.num_train_steps / num_update_steps_per_epoch)
 
         self.total_batch_size = (
             self.per_device_train_batch_size * self.accelerator.num_processes * self.args.gradient_accumulation_steps
