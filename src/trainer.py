@@ -166,7 +166,7 @@ class Trainer:
         # TODO: handle weight tying of model after pushed to XLA device here
         # https://github.com/pytorch/xla/blob/master/TROUBLESHOOTING.md#xla-tensor-quirks
 
-        # re-calculate total training steps
+        # re-calculate total training steps as length of dataloader might have changed
         num_update_steps_per_epoch = math.ceil(len(self.train_dataloader) / self.args.gradient_accumulation_steps)
         self.num_train_steps = self.args.num_train_epochs * num_update_steps_per_epoch
         self.args.num_train_epochs = math.ceil(self.num_train_steps / num_update_steps_per_epoch)
