@@ -227,7 +227,7 @@ class Trainer:
                 # gather and average loss across all processes
                 step_loss_gathered = self.accelerator.gather(loss).mean().item()
                 self._trn_loss_meter.update(
-                    step_loss_gathered * self.args.gradient_accumulation_steps, batch["label"].size(0)
+                    step_loss_gathered * self.args.gradient_accumulation_steps, batch["labels"].size(0)
                 )
             if self.accelerator.sync_gradients:
                 self.global_prog_bar.set_postfix(loss=self._trn_loss_meter.avg)
@@ -262,9 +262,9 @@ class Trainer:
             batch = {k: v.to(self.accelerator.device) for k, v in batch.items()}
             logits, loss = self.model(**batch)
             step_loss_gathered = self.accelerator.gather(loss).mean().item()
-            self._val_loss_meter.update(step_loss_gathered, batch["label"].size(0))
+            self._val_loss_meter.update(step_loss_gathered, batch["labels"].size(0))
             all_logits.append(self.accelerator.gather_for_metrics(logits).cpu().numpy())
-            all_labels.append(self.accelerator.gather_for_metrics(batch["label"]).cpu().numpy())
+            all_labels.append(self.accelerator.gather_for_metrics(batch["labels"]).cpu().numpy())
             val_pbar.update(1)
         val_pbar.close()
         all_logits = np.concatenate(all_logits)
