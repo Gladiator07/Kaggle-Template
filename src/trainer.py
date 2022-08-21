@@ -32,10 +32,10 @@ TODO:
 [x] Add Weights & Biases logging (handle with care in distributed settings
 [x] Add a `final_summary` method which will print/log the complete summary (best and last metric/loss scores, total time taken, etc, etc)
 [x] Test the code thoroughly with multi-GPU setup
-[ ] Test the code thoroughly with TPU setup
-[ ] Check the code completely once (if any mistakes, correct them)
-[ ] Add type hints
-[ ] Add docstrings 😛
+[x] Test the code thoroughly with TPU setup
+[x] Check the code completely once (if any mistakes, correct them)
+[x] Add type hints
+[x] Add docstrings 😛
 """
 
 
@@ -270,6 +270,7 @@ class Trainer:
         )
         self.model.eval()
         for batch in dataloader:
+            # required if `.evaluate()` is called independently
             batch = {k: v.to(self.accelerator.device) for k, v in batch.items()}
             logits, loss = self.model(**batch)
             step_loss_gathered = self.accelerator.gather(loss).mean().item()
