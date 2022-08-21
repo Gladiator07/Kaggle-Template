@@ -19,25 +19,6 @@ from transformers import get_cosine_schedule_with_warmup, get_linear_schedule_wi
 
 from utils import AverageMeter, asHours
 
-"""
-TODO:
-[x] Print valuation metrics nicely after each epoch
-[x] Add clip_grad_norm to training loop
-[x] Make sure that loss calculated is correct
-[x] Maybe pass even the dataloaders to the class to keep the class simple and less cluttered
-[x] Add saving and loading of model checkpoint (handle with care in distributed settings)
-[x] Maybe wrap up the math around scheduler in a private method
-[x] Add a predict method which can perform prediction from loading a model state. Example: `trainer.predict(path, dataloader)`
-[x] Check optimization stuff (total training steps, accumulation , lr scheduler)
-[x] Add Weights & Biases logging (handle with care in distributed settings
-[x] Add a `final_summary` method which will print/log the complete summary (best and last metric/loss scores, total time taken, etc, etc)
-[x] Test the code thoroughly with multi-GPU setup
-[x] Test the code thoroughly with TPU setup
-[x] Check the code completely once (if any mistakes, correct them)
-[x] Add type hints
-[x] Add docstrings 😛
-"""
-
 
 @dataclass
 class EvalOutput:
@@ -71,6 +52,7 @@ class TrainerArguments:
     save_last_checkpoint: Optional[bool] = True
     save_weights_only: Optional[bool] = True
     metric_for_best_model: Optional[str] = "accuracy"
+    load_best_model_at_end: Optional[bool] = False
 
 
 """
@@ -329,6 +311,10 @@ class Trainer:
                 weights_only=self.args.save_weights_only,
             )
 
+        # if load_best_model is True
+        if self.args.load_best_model_at_end:
+            self.load_model(weights_only=True, load_best_model=True)
+
         self._train_end_log_msg()
         self._full_cleanup()
 
@@ -353,10 +339,8 @@ class Trainer:
         # reinit accelerator
         self._init_accelerator()
 
-        # load model
-        if self.accelerator.is_main_process:
-            model_dict = torch.load(checkpoint_path, map_location="cpu")
-            self.model.load_state_dict(model_dict)
+        # load best or last model
+        self.load_model(checkpoint_path, weights_only=True)
 
         # init and prepare accelerator
         self.model, self.test_dataloader = self.accelerator.prepare(self.model, self.test_dataloader)
@@ -392,6 +376,30 @@ class Trainer:
                 model_dict,
                 path,
             )
+
+    def load_model(
+        self,
+        path: Union[str, Path] = None,
+        weights_only: Optional[bool] = False,
+        load_best_model: Optional[bool] = False,
+    ):
+        """
+        Loads the model from the given path (pass best_model as True to load best checkpoint)
+        """
+        if path is None:
+            if load_best_model:
+                path = os.path.join(self.args.output_dir, "best_model.bin")
+            else:
+                # load last model
+                path = os.path.join(self.args.output_dir, "last_model.bin")
+
+        if self.accelerator.is_main_process:
+            model_dict = torch.load(path, map_location="cpu")
+            if weights_only:
+                self.model.load_state_dict(model_dict)
+            else:
+                self.accelerator.unwrap_model(self.model).load_state_dict(model_dict["state_dict"])
+                self.optimizer.load_state_dict(model_dict["optimizer"])
 
     def _train_startup_log_msg(self):
         self.accelerator.print("***** Running training *****")
