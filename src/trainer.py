@@ -228,9 +228,7 @@ class Trainer:
                 self.lr_scheduler.step()
                 # gather and average loss across all processes
                 step_loss_gathered = self.accelerator.gather(loss).mean().item()
-                self._trn_loss_meter.update(
-                    step_loss_gathered * self.args.gradient_accumulation_steps, batch["label"].size(0)
-                )
+                self._trn_loss_meter.update(step_loss_gathered, batch["label"].size(0))
                 if self.accelerator.sync_gradients:
                     self.global_prog_bar.set_postfix(loss=self._trn_loss_meter.avg)
                     self.global_prog_bar.update(1)
