@@ -143,6 +143,13 @@ class Trainer:
 
         # not putting any checks if train_dataloader or val_dataloader is present or not
         # as this method is explicitly used by `.fit()` which requires both dataloaders
+        num_update_steps_per_epoch = math.ceil(len(self.train_dataloader) / self.args.gradient_accumulation_steps)
+        self.num_train_steps = self.args.num_train_epochs * num_update_steps_per_epoch
+        if isinstance(self.args.num_warmup_steps, float):
+            self.args.num_warmup_steps = math.ceil(self.args.num_warmup_steps * self.num_train_steps)
+        self.lr_scheduler = self._set_scheduler(
+            num_warmup_steps=self.args.num_warmup_steps, num_train_steps=self.num_train_steps
+        )
 
         # prepare for distributed training aka put everything in 🤗 Accelerate 🚀
         (
@@ -150,7 +157,10 @@ class Trainer:
             self.optimizer,
             self.train_dataloader,
             self.val_dataloader,
-        ) = self.accelerator.prepare(self.model, self.optimizer, self.train_dataloader, self.val_dataloader)
+            self.lr_scheduler,
+        ) = self.accelerator.prepare(
+            self.model, self.optimizer, self.train_dataloader, self.val_dataloader, self.lr_scheduler
+        )
 
         # TODO: handle weight tying of model after pushed to XLA device here
         # https://github.com/pytorch/xla/blob/master/TROUBLESHOOTING.md#xla-tensor-quirks
@@ -166,8 +176,6 @@ class Trainer:
         self.total_batch_size = (
             self.per_device_train_batch_size * self.accelerator.num_processes * self.args.gradient_accumulation_steps
         )
-        # set learning rate scheduler
-        self.lr_scheduler = self._set_scheduler(self.args.num_warmup_steps, self.num_train_steps)
 
     def _set_scheduler(self, num_warmup_steps: int, num_train_steps: int):
         """
