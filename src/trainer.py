@@ -396,7 +396,7 @@ class Trainer:
         if self.accelerator.is_main_process:
             model_dict = torch.load(path, map_location="cpu")
             if weights_only:
-                self.model.load_state_dict(model_dict)
+                self.accelerator.unwrap_model(self.model).load_state_dict(model_dict)
             else:
                 self.accelerator.unwrap_model(self.model).load_state_dict(model_dict["state_dict"])
                 self.optimizer.load_state_dict(model_dict["optimizer"])
