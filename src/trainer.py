@@ -227,13 +227,13 @@ class Trainer:
                 # gather and average loss across all processes
                 step_loss_gathered = self.accelerator.gather(loss).mean().item()
                 self._trn_loss_meter.update(step_loss_gathered, batch["label"].size(0))
-                if self.accelerator.sync_gradients:
-                    self.global_prog_bar.set_postfix(loss=self._trn_loss_meter.avg)
-                    self.global_prog_bar.update(1)
-                    self._global_step += 1
+            if self.accelerator.sync_gradients:
+                self.global_prog_bar.set_postfix(loss=self._trn_loss_meter.avg)
+                self.global_prog_bar.update(1)
+                self._global_step += 1
 
-                    if self._wandb:
-                        self.accelerator.log({"train/loss": self._trn_loss_meter.val}, step=self._global_step)
+                if self._wandb:
+                    self.accelerator.log({"train/loss": self._trn_loss_meter.val}, step=self._global_step)
 
         # log average epoch loss
         if self._wandb:
